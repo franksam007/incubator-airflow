@@ -52,9 +52,10 @@ from airflow.utils.dag_processing import (AbstractDagFileProcessor,
                                           SimpleDag,
                                           SimpleDagBag,
                                           list_py_file_paths)
-from airflow.utils.db import provide_session, pessimistic_connection_handling
+from airflow.utils.db import (
+    create_session, provide_session, pessimistic_connection_handling)
 from airflow.utils.email import send_email
-from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter
 from airflow.utils.state import State
 
 Base = models.Base
@@ -111,8 +112,8 @@ class BaseJob(Base, LoggingMixin):
             (conf.getint('scheduler', 'JOB_HEARTBEAT_SEC') * 2.1)
         )
 
-    def kill(self):
-        session = settings.Session()
+    @provide_session
+    def kill(self, session=None):
         job = session.query(BaseJob).filter(BaseJob.id == self.id).first()
         job.end_date = datetime.utcnow()
         try:
@@ -121,7 +122,6 @@ class BaseJob(Base, LoggingMixin):
             self.log.error('on_kill() method failed')
         session.merge(job)
         session.commit()
-        session.close()
         raise AirflowException("Job shut down externally.")
 
     def on_kill(self):
@@ -152,11 +152,10 @@ class BaseJob(Base, LoggingMixin):
         heart rate. If you go over 60 seconds before calling it, it won't
         sleep at all.
         '''
-        session = settings.Session()
-        job = session.query(BaseJob).filter_by(id=self.id).one()
-        make_transient(job)
-        session.commit()
-        session.close()
+        with create_session() as session:
+            job = session.query(BaseJob).filter_by(id=self.id).one()
+            make_transient(job)
+            session.commit()
 
         if job.state == State.SHUTDOWN:
             self.kill()
@@ -168,41 +167,37 @@ class BaseJob(Base, LoggingMixin):
                 0,
                 self.heartrate - (datetime.utcnow() - job.latest_heartbeat).total_seconds())
 
-        # Don't keep session open while sleeping as it leaves a connection open
-        session.close()
         sleep(sleep_for)
 
         # Update last heartbeat time
-        session = settings.Session()
-        job = session.query(BaseJob).filter(BaseJob.id == self.id).first()
-        job.latest_heartbeat = datetime.utcnow()
-        session.merge(job)
-        session.commit()
+        with create_session() as session:
+            job = session.query(BaseJob).filter(BaseJob.id == self.id).first()
+            job.latest_heartbeat = datetime.utcnow()
+            session.merge(job)
+            session.commit()
 
-        self.heartbeat_callback(session=session)
-        session.close()
-        self.log.debug('[heartbeat]')
+            self.heartbeat_callback(session=session)
+            self.log.debug('[heartbeat]')
 
     def run(self):
         Stats.incr(self.__class__.__name__.lower() + '_start', 1, 1)
         # Adding an entry in the DB
-        session = settings.Session()
-        self.state = State.RUNNING
-        session.add(self)
-        session.commit()
-        id_ = self.id
-        make_transient(self)
-        self.id = id_
+        with create_session() as session:
+            self.state = State.RUNNING
+            session.add(self)
+            session.commit()
+            id_ = self.id
+            make_transient(self)
+            self.id = id_
 
-        # Run
-        self._execute()
+            # Run
+            self._execute()
 
-        # Marking the success in the DB
-        self.end_date = datetime.utcnow()
-        self.state = State.SUCCESS
-        session.merge(self)
-        session.commit()
-        session.close()
+            # Marking the success in the DB
+            self.end_date = datetime.utcnow()
+            self.state = State.SUCCESS
+            session.merge(self)
+            session.commit()
 
         Stats.incr(self.__class__.__name__.lower() + '_end', 1, 1)
 
@@ -344,6 +339,10 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin):
         def helper():
             # This helper runs in the newly created process
             log = logging.getLogger("airflow.processor")
+
+            stdout = StreamLogWriter(log, logging.INFO)
+            stderr = StreamLogWriter(log, logging.WARN)
+
             for handler in log.handlers:
                 try:
                     handler.set_context(file_path)
@@ -353,6 +352,10 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin):
                     pass
 
             try:
+                # redirect stdout/stderr to log
+                sys.stdout = stdout
+                sys.stderr = stderr
+
                 # Re-configure the ORM engine as there are issues with multiple processes
                 settings.configure_orm()
 
@@ -376,6 +379,9 @@ class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin):
                 # Log exceptions through the logging framework.
                 log.exception("Got an exception! Propagating...")
                 raise
+            finally:
+                sys.stdout = sys.__stdout__
+                sys.stderr = sys.__stderr__
 
         p = multiprocessing.Process(target=helper,
                                     args=(),
@@ -700,7 +706,6 @@ class SchedulerJob(BaseJob):
                     sla.notification_sent = True
                     session.merge(sla)
             session.commit()
-            session.close()
 
     @staticmethod
     @provide_session
@@ -875,13 +880,13 @@ class SchedulerJob(BaseJob):
                 )
                 return next_run
 
-    def _process_task_instances(self, dag, queue):
+    @provide_session
+    def _process_task_instances(self, dag, queue, session=None):
         """
         This method schedules the tasks for a single DAG by looking at the
         active DAG runs and adding task instances that should run to the
         queue.
         """
-        session = settings.Session()
 
         # update the state of the previously active dag runs
         dag_runs = DagRun.find(dag_id=dag.dag_id, state=State.RUNNING, session=session)
@@ -937,8 +942,6 @@ class SchedulerJob(BaseJob):
                         session=session):
                     self.log.debug('Queuing task: %s', ti)
                     queue.append(ti.key)
-
-        session.close()
 
     @provide_session
     def _change_state_for_tis_without_dagrun(self,
@@ -1579,10 +1582,8 @@ class SchedulerJob(BaseJob):
         """
         self.executor.start()
 
-        session = settings.Session()
         self.log.info("Resetting orphaned tasks for active dag runs")
-        self.reset_state_for_orphaned_tasks(session=session)
-        session.close()
+        self.reset_state_for_orphaned_tasks()
 
         execute_start_time = datetime.utcnow()
 
@@ -1971,9 +1972,7 @@ class BackfillJob(BaseJob):
                     "reaching concurrency limits. Re-adding task to queue.",
                     ti
                 )
-                session = settings.Session()
-                ti.set_state(State.SCHEDULED, session=session)
-                session.close()
+                ti.set_state(State.SCHEDULED)
                 ti_status.started.pop(key)
                 ti_status.to_run[key] = ti
 
@@ -2384,12 +2383,12 @@ class BackfillJob(BaseJob):
 
         ti_status.executed_dag_run_dates.update(processed_dag_run_dates)
 
-    def _execute(self):
+    @provide_session
+    def _execute(self, session=None):
         """
         Initializes all components required to run a dag for a specified date range and
         calls helper method to execute the tasks.
         """
-        session = settings.Session()
         ti_status = BackfillJob._DagRunTaskStatus()
 
         start_date = self.bf_start_date
@@ -2445,7 +2444,6 @@ class BackfillJob(BaseJob):
         finally:
             executor.end()
             session.commit()
-            session.close()
 
         self.log.info("Backfill done. Exiting.")
 
