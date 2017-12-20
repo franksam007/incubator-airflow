@@ -175,7 +175,7 @@ class ColumnMetadata:
     # TODO: Define concrete save_column_metadata
 
 
-class DataContainerMetadata:
+class DataSetMetadata:
     def __init__(
         self,
         data_set_name,
@@ -196,5 +196,14 @@ class DataContainerMetadata:
         self.extra = extra
         self.columns = columns
 
+    def get_column_names(self):
+        col_name = []
+        if self.columns:
+            for item in self.columns[:]:
+                col_name.append(item.column_name)
+        return col_name
+
+    def get_column_names(self, pattern):
+        
     # TODO: Define class methods, just like methods in ColumnMetadata
 
