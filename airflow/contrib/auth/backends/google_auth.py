@@ -109,6 +109,7 @@ class GoogleAuthBackend(object):
         return self.google_oauth.authorize(callback=url_for(
             'google_oauth_callback',
             _external=True,
+            _scheme='https',
             next=request.args.get('next') or request.referrer or None))
 
     def get_google_user_profile_info(self, google_token):
@@ -124,7 +125,8 @@ class GoogleAuthBackend(object):
 
     def domain_check(self, email):
         domain = email.split('@')[1]
-        if domain == get_config_param('domain'):
+        domains = get_config_param('domain').split(',')
+        if domain in domains:
             return True
         return False
 
@@ -182,4 +184,3 @@ login_manager = GoogleAuthBackend()
 
 def login(self, request):
     return login_manager.login(request)
-

@@ -20,6 +20,7 @@ from airflow.utils.decorators import apply_defaults
 class RedshiftToS3Transfer(BaseOperator):
     """
     Executes an UNLOAD command to s3 as a CSV with headers
+
     :param schema: reference to a specific schema in redshift database
     :type schema: string
     :param table: reference to a specific table in redshift database
@@ -30,8 +31,8 @@ class RedshiftToS3Transfer(BaseOperator):
     :type s3_key: string
     :param redshift_conn_id: reference to a specific redshift database
     :type redshift_conn_id: string
-    :param s3_conn_id: reference to a specific S3 connection
-    :type s3_conn_id: string
+    :param aws_conn_id: reference to a specific S3 connection
+    :type aws_conn_id: string
     :param options: reference to a list of UNLOAD options
     :type options: list
     """
@@ -48,7 +49,7 @@ class RedshiftToS3Transfer(BaseOperator):
             s3_bucket,
             s3_key,
             redshift_conn_id='redshift_default',
-            s3_conn_id='s3_default',
+            aws_conn_id='aws_default',
             unload_options=tuple(),
             autocommit=False,
             parameters=None,
@@ -59,14 +60,14 @@ class RedshiftToS3Transfer(BaseOperator):
         self.s3_bucket = s3_bucket
         self.s3_key = s3_key
         self.redshift_conn_id = redshift_conn_id
-        self.s3_conn_id = s3_conn_id
+        self.aws_conn_id = aws_conn_id
         self.unload_options = unload_options
         self.autocommit = autocommit
         self.parameters = parameters
 
     def execute(self, context):
         self.hook = PostgresHook(postgres_conn_id=self.redshift_conn_id)
-        self.s3 = S3Hook(s3_conn_id=self.s3_conn_id)
+        self.s3 = S3Hook(aws_conn_id=self.aws_conn_id)
         a_key, s_key = self.s3.get_credentials()
         unload_options = '\n\t\t\t'.join(self.unload_options)
 

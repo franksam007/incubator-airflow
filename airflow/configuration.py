@@ -28,6 +28,8 @@ import sys
 
 from future import standard_library
 
+from six import iteritems
+
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 standard_library.install_aliases()
@@ -85,7 +87,10 @@ def run_command(command):
     Runs command and returns stdout
     """
     process = subprocess.Popen(
-        shlex.split(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        shlex.split(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True)
     output, stderr = [stream.decode(sys.getdefaultencoding(), 'ignore')
                       for stream in process.communicate()]
 
@@ -113,7 +118,7 @@ class AirflowConfigParser(ConfigParser):
         ('core', 'sql_alchemy_conn'),
         ('core', 'fernet_key'),
         ('celery', 'broker_url'),
-        ('celery', 'celery_result_backend')
+        ('celery', 'result_backend')
     }
 
     def __init__(self, *args, **kwargs):
@@ -233,6 +238,31 @@ class AirflowConfigParser(ConfigParser):
         ConfigParser.read(self, filenames)
         self._validate()
 
+    def getsection(self, section):
+        """
+        Returns the section as a dict. Values are converted to int, float, bool
+        as required.
+        :param section: section from the config
+        :return: dict
+        """
+        if section in self._sections:
+            _section = self._sections[section]
+            for key, val in iteritems(self._sections[section]):
+                try:
+                    val = int(val)
+                except ValueError:
+                    try:
+                        val = float(val)
+                    except ValueError:
+                        if val.lower() in ('t', 'true'):
+                            val = True
+                        elif val.lower() in ('f', 'false'):
+                            val = False
+                _section[key] = val
+            return _section
+
+        return None
+
     def as_dict(self, display_source=False, display_sensitive=False):
         """
         Returns the current configuration as an OrderedDict of OrderedDicts.
@@ -307,7 +337,8 @@ def mkdir_p(path):
         if exc.errno == errno.EEXIST and os.path.isdir(path):
             pass
         else:
-            raise AirflowConfigException('Had trouble creating a directory')
+            raise AirflowConfigException(
+                'Error creating {}: {}'.format(path, exc.strerror))
 
 
 # Setting AIRFLOW_HOME and AIRFLOW_CONFIG from environment variables, using
@@ -418,6 +449,10 @@ def getfloat(section, key):
 
 def getint(section, key):
     return conf.getint(section, key)
+
+
+def getsection(section):
+    return conf.getsection(section)
 
 
 def has_option(section, key):

@@ -66,7 +66,11 @@ Here's the list of the subpackages and what they enable:
 |               |                                              | support as an Airflow backend                   |
 +---------------+----------------------------------------------+-------------------------------------------------+
 |  mysql        | ``pip install apache-airflow[mysql]``        | MySQL operators and hook, support as            |
-|               |                                              | an Airflow backend                              |
+|               |                                              | an Airflow backend. The version of MySQL server |
+|               |                                              | has to be 5.6.4+. The exact version upper bound | 
+|               |                                              | depends on version of ``mysqlclient`` package.  |
+|               |                                              | For example, ``mysqlclient`` 1.3.12 can only be |
+|               |                                              | used with MySQL server 5.6.4 through 5.7.       |
 +---------------+----------------------------------------------+-------------------------------------------------+
 |  password     | ``pip install apache-airflow[password]``     | Password Authentication for users               |
 +---------------+----------------------------------------------+-------------------------------------------------+
@@ -90,3 +94,17 @@ Here's the list of the subpackages and what they enable:
 +---------------+----------------------------------------------+-------------------------------------------------+
 |  redis        | ``pip install apache-airflow[redis]``        | Redis hooks and sensors                         |
 +---------------+----------------------------------------------+-------------------------------------------------+
+
+Initiating Airflow Database
+'''''''''''''''''''''''''''
+
+Airflow requires a database to be initiated before you can run tasks. If you're just
+experimenting and learning Airflow, you can stick with the default SQLite option. If
+you don't want to use SQLite, then take a look at :doc:`configuration` to setup a
+different database.
+
+After configuration, you'll need to initialize the database before you can run tasks:
+
+.. code-block:: bash
+
+    airflow initdb

@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 
-from __future__ import print_function
+from __future__ import print_function, unicode_literals
 from six.moves import zip
 from past.builtins import basestring
 
@@ -25,6 +25,7 @@ import time
 from tempfile import NamedTemporaryFile
 import hive_metastore
 
+from airflow import configuration as conf
 from airflow.exceptions import AirflowException
 from airflow.hooks.base_hook import BaseHook
 from airflow.utils.helpers import as_flattened_list
@@ -82,7 +83,8 @@ class HiveCliHook(BaseHook):
                     "Invalid Mapred Queue Priority.  Valid values are: "
                     "{}".format(', '.join(HIVE_QUEUE_PRIORITIES)))
 
-        self.mapred_queue = mapred_queue
+        self.mapred_queue = mapred_queue or conf.get('hive',
+                                                     'default_hive_mapred_queue')
         self.mapred_queue_priority = mapred_queue_priority
         self.mapred_job_name = mapred_job_name
 
@@ -181,7 +183,14 @@ class HiveCliHook(BaseHook):
                     hive_conf_params.extend(
                         ['-hiveconf',
                          'mapreduce.job.queuename={}'
-                         .format(self.mapred_queue)])
+                         .format(self.mapred_queue),
+                         '-hiveconf',
+                         'mapred.job.queue.name={}'
+                         .format(self.mapred_queue),
+                         '-hiveconf',
+                         'tez.job.queue.name={}'
+                         .format(self.mapred_queue)
+                         ])
 
                 if self.mapred_queue_priority:
                     hive_conf_params.extend(
@@ -204,7 +213,8 @@ class HiveCliHook(BaseHook):
                     hive_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    cwd=tmp_dir)
+                    cwd=tmp_dir,
+                    close_fds=True)
                 self.sp = sp
                 stdout = ''
                 while True:
@@ -419,8 +429,10 @@ class HiveCliHook(BaseHook):
 
 
 class HiveMetastoreHook(BaseHook):
-
     """ Wrapper to interact with the Hive Metastore"""
+
+    # java short max val
+    MAX_PART_COUNT = 32767
 
     def __init__(self, metastore_conn_id='metastore_default'):
         self.metastore_conn = self.get_connection(metastore_conn_id)
@@ -591,16 +603,46 @@ class HiveMetastoreHook(BaseHook):
             if filter:
                 parts = self.metastore.get_partitions_by_filter(
                     db_name=schema, tbl_name=table_name,
-                    filter=filter, max_parts=32767)
+                    filter=filter, max_parts=HiveMetastoreHook.MAX_PART_COUNT)
             else:
                 parts = self.metastore.get_partitions(
-                    db_name=schema, tbl_name=table_name, max_parts=32767)
+                    db_name=schema, tbl_name=table_name,
+                    max_parts=HiveMetastoreHook.MAX_PART_COUNT)
 
             self.metastore._oprot.trans.close()
             pnames = [p.name for p in table.partitionKeys]
             return [dict(zip(pnames, p.values)) for p in parts]
 
-    def max_partition(self, schema, table_name, field=None, filter=None):
+    @staticmethod
+    def _get_max_partition_from_part_names(part_names, key_name):
+        """
+        Helper method to get max partition from part names. Works only
+        when partition format follows '{key}={value}' and key_name is name of
+        the only partition key.
+        :param part_names: list of partition names
+        :type part_names: list
+        :param key_name: partition key name
+        :type key_name: str
+        :return: Max partition or None if part_names is empty.
+        """
+        if not part_names:
+            return None
+
+        prefix = key_name + '='
+        prefix_len = len(key_name) + 1
+        max_val = None
+        for part_name in part_names:
+            if part_name.startswith(prefix):
+                if max_val is None:
+                    max_val = part_name[prefix_len:]
+                else:
+                    max_val = max(max_val, part_name[prefix_len:])
+            else:
+                raise AirflowException(
+                    "Partition name mal-formatted: {}".format(part_name))
+        return max_val
+
+    def max_partition(self, schema, table_name, field=None):
         """
         Returns the maximum value for all partitions in a table. Works only
         for tables that have a single partition key. For subpartitioned
@@ -611,17 +653,23 @@ class HiveMetastoreHook(BaseHook):
         >>> hh.max_partition(schema='airflow', table_name=t)
         '2015-01-01'
         """
-        parts = self.get_partitions(schema, table_name, filter)
-        if not parts:
-            return None
-        elif len(parts[0]) == 1:
-            field = list(parts[0].keys())[0]
-        elif not field:
+        self.metastore._oprot.trans.open()
+        table = self.metastore.get_table(dbname=schema, tbl_name=table_name)
+        if len(table.partitionKeys) != 1:
             raise AirflowException(
-                "Please specify the field you want the max "
-                "value for")
+                "The table isn't partitioned by a single partition key")
 
-        return max([p[field] for p in parts])
+        key_name = table.partitionKeys[0].name
+        if field is not None and key_name != field:
+            raise AirflowException("Provided field is not the partition key")
+
+        part_names = \
+            self.metastore.get_partition_names(schema,
+                                               table_name,
+                                               max_parts=HiveMetastoreHook.MAX_PART_COUNT)
+        self.metastore._oprot.trans.close()
+
+        return HiveMetastoreHook._get_max_partition_from_part_names(part_names, key_name)
 
     def table_exists(self, table_name, db='default'):
         """

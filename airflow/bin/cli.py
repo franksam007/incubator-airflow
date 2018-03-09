@@ -27,7 +27,7 @@ from importlib import import_module
 import argparse
 from builtins import input
 from collections import namedtuple
-from dateutil.parser import parse as parsedate
+from airflow.utils.timezone import parse as parsedate
 import json
 from tabulate import tabulate
 
@@ -54,7 +54,9 @@ from airflow.models import (DagModel, DagBag, TaskInstance,
 
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
 from airflow.utils import db as db_utils
-from airflow.utils.log.logging_mixin import LoggingMixin, redirect_stderr, redirect_stdout
+from airflow.utils.net import get_hostname
+from airflow.utils.log.logging_mixin import (LoggingMixin, redirect_stderr,
+                                             redirect_stdout, set_context)
 from airflow.www.app import cached_app
 
 from sqlalchemy import func
@@ -202,6 +204,26 @@ def trigger_dag(args):
     log.info(message)
 
 
+def delete_dag(args):
+    """
+    Deletes all DB records related to the specified dag
+    :param args:
+    :return:
+    """
+    log = LoggingMixin().log
+    if args.yes or input(
+            "This will drop all existing records related to the specified DAG. "
+            "Proceed? (y/n)").upper() == "Y":
+        try:
+            message = api_client.delete_dag(dag_id=args.dag_id)
+        except IOError as err:
+            log.error(err)
+            raise AirflowException(err)
+        log.info(message)
+    else:
+        print("Bail.")
+
+
 def pool(args):
     log = LoggingMixin().log
 
@@ -323,12 +345,63 @@ def set_is_paused(is_paused, args, dag=None):
     print(msg)
 
 
+def _run(args, dag, ti):
+    if args.local:
+        run_job = jobs.LocalTaskJob(
+            task_instance=ti,
+            mark_success=args.mark_success,
+            pickle_id=args.pickle,
+            ignore_all_deps=args.ignore_all_dependencies,
+            ignore_depends_on_past=args.ignore_depends_on_past,
+            ignore_task_deps=args.ignore_dependencies,
+            ignore_ti_state=args.force,
+            pool=args.pool)
+        run_job.run()
+    elif args.raw:
+        ti._run_raw_task(
+            mark_success=args.mark_success,
+            job_id=args.job_id,
+            pool=args.pool,
+        )
+    else:
+        pickle_id = None
+        if args.ship_dag:
+            try:
+                # Running remotely, so pickling the DAG
+                session = settings.Session()
+                pickle = DagPickle(dag)
+                session.add(pickle)
+                session.commit()
+                pickle_id = pickle.id
+                # TODO: This should be written to a log
+                print('Pickled dag {dag} as pickle_id:{pickle_id}'
+                      .format(**locals()))
+            except Exception as e:
+                print('Could not pickle the DAG')
+                print(e)
+                raise e
+
+        executor = GetDefaultExecutor()
+        executor.start()
+        print("Sending to executor.")
+        executor.queue_task_instance(
+            ti,
+            mark_success=args.mark_success,
+            pickle_id=pickle_id,
+            ignore_all_deps=args.ignore_all_dependencies,
+            ignore_depends_on_past=args.ignore_depends_on_past,
+            ignore_task_deps=args.ignore_dependencies,
+            ignore_ti_state=args.force,
+            pool=args.pool)
+        executor.heartbeat()
+        executor.end()
+
+
 def run(args, dag=None):
     # Disable connection pooling to reduce the # of connections on the DB
     # while it's waiting for the task to finish.
     settings.configure_orm(disable_connection_pool=True)
 
-    db_utils.pessimistic_connection_handling()
     if dag:
         args.dag_id = dag.dag_id
 
@@ -363,85 +436,18 @@ def run(args, dag=None):
     ti = TaskInstance(task, args.execution_date)
     ti.refresh_from_db()
 
-    log = logging.getLogger('airflow.task')
-    if args.raw:
-        log = logging.getLogger('airflow.task.raw')
+    ti.init_run_context(raw=args.raw)
 
-    for handler in log.handlers:
-        try:
-            handler.set_context(ti)
-        except AttributeError:
-            # Not all handlers need to have context passed in so we ignore
-            # the error when handlers do not have set_context defined.
-            pass
+    hostname = get_hostname()
+    log.info("Running %s on host %s", ti, hostname)
 
-    hostname = socket.getfqdn()
-    log.info("Running on host %s", hostname)
-
-    with redirect_stdout(log, logging.INFO), redirect_stderr(log, logging.WARN):
-        if args.local:
-            run_job = jobs.LocalTaskJob(
-                task_instance=ti,
-                mark_success=args.mark_success,
-                pickle_id=args.pickle,
-                ignore_all_deps=args.ignore_all_dependencies,
-                ignore_depends_on_past=args.ignore_depends_on_past,
-                ignore_task_deps=args.ignore_dependencies,
-                ignore_ti_state=args.force,
-                pool=args.pool)
-            run_job.run()
-        elif args.raw:
-            ti._run_raw_task(
-                mark_success=args.mark_success,
-                job_id=args.job_id,
-                pool=args.pool,
-            )
-        else:
-            pickle_id = None
-            if args.ship_dag:
-                try:
-                    # Running remotely, so pickling the DAG
-                    session = settings.Session()
-                    pickle = DagPickle(dag)
-                    session.add(pickle)
-                    session.commit()
-                    pickle_id = pickle.id
-                    # TODO: This should be written to a log
-                    print((
-                              'Pickled dag {dag} '
-                              'as pickle_id:{pickle_id}').format(**locals()))
-                except Exception as e:
-                    print('Could not pickle the DAG')
-                    print(e)
-                    raise e
-
-            executor = GetDefaultExecutor()
-            executor.start()
-            print("Sending to executor.")
-            executor.queue_task_instance(
-                ti,
-                mark_success=args.mark_success,
-                pickle_id=pickle_id,
-                ignore_all_deps=args.ignore_all_dependencies,
-                ignore_depends_on_past=args.ignore_depends_on_past,
-                ignore_task_deps=args.ignore_dependencies,
-                ignore_ti_state=args.force,
-                pool=args.pool)
-            executor.heartbeat()
-            executor.end()
-
-    # Child processes should not flush or upload to remote
-    if args.raw:
-        return
-
-    # Force the log to flush. The flush is important because we
-    # might subsequently read from the log to insert into S3 or
-    # Google cloud storage. Explicitly close the handler is
-    # needed in order to upload to remote storage services.
-    for handler in log.handlers:
-        handler.flush()
-        handler.close()
-
+    if args.interactive:
+        _run(args, dag, ti)
+    else:
+        with redirect_stdout(ti.log, logging.INFO),\
+                redirect_stderr(ti.log, logging.WARN):
+            _run(args, dag, ti)
+        logging.shutdown()
 
 def task_failed_deps(args):
     """
@@ -570,6 +576,22 @@ def clear(args):
         include_subdags=not args.exclude_subdags)
 
 
+def get_num_ready_workers_running(gunicorn_master_proc):
+    workers = psutil.Process(gunicorn_master_proc.pid).children()
+
+    def ready_prefix_on_cmdline(proc):
+        try:
+            cmdline = proc.cmdline()
+            if len(cmdline) > 0:
+                return settings.GUNICORN_WORKER_READY_PREFIX in cmdline[0]
+        except psutil.NoSuchProcess:
+            pass
+        return False
+
+    ready_workers = [proc for proc in workers if ready_prefix_on_cmdline(proc)]
+    return len(ready_workers)
+
+
 def restart_workers(gunicorn_master_proc, num_workers_expected):
     """
     Runs forever, monitoring the child processes of @gunicorn_master_proc and
@@ -606,14 +628,6 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
     def get_num_workers_running(gunicorn_master_proc):
         workers = psutil.Process(gunicorn_master_proc.pid).children()
         return len(workers)
-
-    def get_num_ready_workers_running(gunicorn_master_proc):
-        workers = psutil.Process(gunicorn_master_proc.pid).children()
-        ready_workers = [
-            proc for proc in workers
-            if settings.GUNICORN_WORKER_READY_PREFIX in proc.cmdline()[0]
-        ]
-        return len(ready_workers)
 
     def start_refresh(gunicorn_master_proc):
         batch_size = conf.getint('webserver', 'worker_refresh_batch_size')
@@ -771,7 +785,7 @@ def webserver(args):
                 },
             )
             with ctx:
-                subprocess.Popen(run_args)
+                subprocess.Popen(run_args, close_fds=True)
 
                 # Reading pid file directly, since Popen#pid doesn't
                 # seem to return the right value with DaemonContext.
@@ -790,7 +804,7 @@ def webserver(args):
             stdout.close()
             stderr.close()
         else:
-            gunicorn_master_proc = subprocess.Popen(run_args)
+            gunicorn_master_proc = subprocess.Popen(run_args, close_fds=True)
 
             signal.signal(signal.SIGINT, kill_proc)
             signal.signal(signal.SIGTERM, kill_proc)
@@ -881,7 +895,7 @@ def worker(args):
             stderr=stderr,
         )
         with ctx:
-            sp = subprocess.Popen(['airflow', 'serve_logs'], env=env)
+            sp = subprocess.Popen(['airflow', 'serve_logs'], env=env, close_fds=True)
             worker.run(**options)
             sp.kill()
 
@@ -891,7 +905,7 @@ def worker(args):
         signal.signal(signal.SIGINT, sigint_handler)
         signal.signal(signal.SIGTERM, sigint_handler)
 
-        sp = subprocess.Popen(['airflow', 'serve_logs'], env=env)
+        sp = subprocess.Popen(['airflow', 'serve_logs'], env=env, close_fds=True)
 
         worker.run(**options)
         sp.kill()
@@ -1066,6 +1080,10 @@ def flower(args):
     if args.broker_api:
         api = '--broker_api=' + args.broker_api
 
+    url_prefix = ''
+    if args.url_prefix:
+        url_prefix = '--url-prefix=' + args.url_prefix
+
     flower_conf = ''
     if args.flower_conf:
         flower_conf = '--conf=' + args.flower_conf
@@ -1082,7 +1100,8 @@ def flower(args):
         )
 
         with ctx:
-            os.execvp("flower", ['flower', '-b', broka, address, port, api, flower_conf])
+            os.execvp("flower", ['flower', '-b',
+                                 broka, address, port, api, flower_conf, url_prefix])
 
         stdout.close()
         stderr.close()
@@ -1090,7 +1109,8 @@ def flower(args):
         signal.signal(signal.SIGINT, sigint_handler)
         signal.signal(signal.SIGTERM, sigint_handler)
 
-        os.execvp("flower", ['flower', '-b', broka, address, port, api, flower_conf])
+        os.execvp("flower", ['flower', '-b',
+                             broka, address, port, api, flower_conf, url_prefix])
 
 
 def kerberos(args):  # noqa
@@ -1158,6 +1178,11 @@ class CLIFactory(object):
             ("--stdout",), "Redirect stdout to this file"),
         'log_file': Arg(
             ("-l", "--log-file"), "Location of the log file"),
+        'yes': Arg(
+            ("-y", "--yes"),
+            "Do not prompt to confirm reset. Use with care!",
+            "store_true",
+            default=False),
 
         # backfill
         'mark_success': Arg(
@@ -1287,6 +1312,11 @@ class CLIFactory(object):
         # dependency. This flag should be deprecated and renamed to 'ignore_ti_state' and
         # the "ignore_all_dependencies" command should be called the"force" command
         # instead.
+        'interactive': Arg(
+            ('-int', '--interactive'),
+            help='Do not capture standard output and error streams '
+                 '(useful for interactive debugging)',
+            action='store_true'),
         'force': Arg(
             ("-f", "--force"),
             "Ignore previous task instance state, rerun regardless if task already "
@@ -1370,12 +1400,6 @@ class CLIFactory(object):
             default=conf.get('webserver', 'ERROR_LOGFILE'),
             help="The logfile to store the webserver error log. Use '-' to print to "
                  "stderr."),
-        # resetdb
-        'yes': Arg(
-            ("-y", "--yes"),
-            "Do not prompt to confirm reset. Use with care!",
-            "store_true",
-            default=False),
         # scheduler
         'dag_id_opt': Arg(("-d", "--dag_id"), help="The id of the dag to run"),
         'run_duration': Arg(
@@ -1403,7 +1427,7 @@ class CLIFactory(object):
             ("-c", "--concurrency"),
             type=int,
             help="The number of worker processes",
-            default=conf.get('celery', 'celeryd_concurrency')),
+            default=conf.get('celery', 'worker_concurrency')),
         'celery_hostname': Arg(
             ("-cn", "--celery_hostname"),
             help=("Set the hostname of celery worker "
@@ -1422,6 +1446,10 @@ class CLIFactory(object):
         'flower_conf': Arg(
             ("-fc", "--flower_conf"),
             help="Configuration file for flower"),
+        'flower_url_prefix': Arg(
+            ("-u", "--url_prefix"),
+            default=conf.get('celery', 'FLOWER_URL_PREFIX'),
+            help="URL prefix for Flower"),
         'task_params': Arg(
             ("-tp", "--task_params"),
             help="Sends a JSON params dict to the task"),
@@ -1508,6 +1536,10 @@ class CLIFactory(object):
             'help': "Trigger a DAG run",
             'args': ('dag_id', 'subdir', 'run_id', 'conf', 'exec_date'),
         }, {
+            'func': delete_dag,
+            'help': "Delete all DB records related to the specified DAG",
+            'args': ('dag_id', 'yes',),
+        }, {
             'func': pool,
             'help': "CRUD operations on pools",
             "args": ('pool_set', 'pool_get', 'pool_delete'),
@@ -1531,7 +1563,7 @@ class CLIFactory(object):
                 'dag_id', 'task_id', 'execution_date', 'subdir',
                 'mark_success', 'force', 'pool', 'cfg_path',
                 'local', 'raw', 'ignore_all_dependencies', 'ignore_dependencies',
-                'ignore_depends_on_past', 'ship_dag', 'pickle', 'job_id'),
+                'ignore_depends_on_past', 'ship_dag', 'pickle', 'job_id', 'interactive',),
         }, {
             'func': initdb,
             'help': "Initialize the metadata database",
@@ -1564,7 +1596,7 @@ class CLIFactory(object):
             'func': test,
             'help': (
                 "Test a task instance. This will run a task without checking for "
-                "dependencies or recording it's state in the database."),
+                "dependencies or recording its state in the database."),
             'args': (
                 'dag_id', 'task_id', 'execution_date', 'subdir', 'dry_run',
                 'task_params'),
@@ -1596,8 +1628,8 @@ class CLIFactory(object):
         }, {
             'func': flower,
             'help': "Start a Celery Flower",
-            'args': ('flower_hostname', 'flower_port', 'flower_conf', 'broker_api',
-                     'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
+            'args': ('flower_hostname', 'flower_port', 'flower_conf', 'flower_url_prefix',
+                     'broker_api', 'pid', 'daemon', 'stdout', 'stderr', 'log_file'),
         }, {
             'func': version,
             'help': "Show the version",

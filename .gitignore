@@ -62,6 +62,7 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+.pytest_cache
 
 # Translations
 *.mo
@@ -112,6 +113,10 @@ ENV/
 
 # PyCharm
 .idea/
+*.iml
+
+# Visual Studio Code
+.vscode/
 
 # vim
 *.swp

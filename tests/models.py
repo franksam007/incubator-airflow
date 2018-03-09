@@ -20,10 +20,14 @@ from __future__ import unicode_literals
 import datetime
 import logging
 import os
+import pendulum
 import unittest
 import time
+import six
+import re
+import urllib
 
-from airflow import models, settings, AirflowException
+from airflow import configuration, models, settings, AirflowException
 from airflow.exceptions import AirflowSkipException
 from airflow.jobs import BackfillJob
 from airflow.models import DAG, TaskInstance as TI
@@ -31,18 +35,21 @@ from airflow.models import State as ST
 from airflow.models import DagModel, DagStat
 from airflow.models import clear_task_instances
 from airflow.models import XCom
+from airflow.models import Connection
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.bash_operator import BashOperator
 from airflow.operators.python_operator import PythonOperator
 from airflow.operators.python_operator import ShortCircuitOperator
 from airflow.ti_deps.deps.trigger_rule_dep import TriggerRuleDep
+from airflow.utils import timezone
+from airflow.utils.weight_rule import WeightRule
 from airflow.utils.state import State
 from airflow.utils.trigger_rule import TriggerRule
 from mock import patch
 from parameterized import parameterized
 
 
-DEFAULT_DATE = datetime.datetime(2016, 1, 1)
+DEFAULT_DATE = timezone.datetime(2016, 1, 1)
 TEST_DAGS_FOLDER = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), 'dags')
 
@@ -80,7 +87,6 @@ class DagTest(unittest.TestCase):
     def test_dag_as_context_manager(self):
         """
         Test DAG as a context manager.
-
         When used as a context manager, Operators are automatically added to
         the DAG (unless they specifiy a different DAG)
         """
@@ -198,6 +204,96 @@ class DagTest(unittest.TestCase):
             default_args={'owner': 'owner1'})
 
         self.assertEquals(tuple(), dag.topological_sort())
+
+    def test_dag_task_priority_weight_total(self):
+        width = 5
+        depth = 5
+        weight = 5
+        pattern = re.compile('stage(\\d*).(\\d*)')
+        # Fully connected parallel tasks. i.e. every task at each parallel
+        # stage is dependent on every task in the previous stage.
+        # Default weight should be calculated using downstream descendants
+        with DAG('dag', start_date=DEFAULT_DATE,
+                 default_args={'owner': 'owner1'}) as dag:
+            pipeline = [
+                [DummyOperator(
+                    task_id='stage{}.{}'.format(i, j), priority_weight=weight)
+                    for j in range(0, width)] for i in range(0, depth)
+            ]
+            for d, stage in enumerate(pipeline):
+                if d == 0:
+                    continue
+                for current_task in stage:
+                    for prev_task in pipeline[d - 1]:
+                        current_task.set_upstream(prev_task)
+
+            for task in six.itervalues(dag.task_dict):
+                match = pattern.match(task.task_id)
+                task_depth = int(match.group(1))
+                # the sum of each stages after this task + itself
+                correct_weight = ((depth - (task_depth + 1)) * width + 1) * weight
+
+                calculated_weight = task.priority_weight_total
+                self.assertEquals(calculated_weight, correct_weight)
+
+        # Same test as above except use 'upstream' for weight calculation
+        weight = 3
+        with DAG('dag', start_date=DEFAULT_DATE,
+                 default_args={'owner': 'owner1'}) as dag:
+            pipeline = [
+                [DummyOperator(
+                    task_id='stage{}.{}'.format(i, j), priority_weight=weight,
+                    weight_rule=WeightRule.UPSTREAM)
+                    for j in range(0, width)] for i in range(0, depth)
+            ]
+            for d, stage in enumerate(pipeline):
+                if d == 0:
+                    continue
+                for current_task in stage:
+                    for prev_task in pipeline[d - 1]:
+                        current_task.set_upstream(prev_task)
+
+            for task in six.itervalues(dag.task_dict):
+                match = pattern.match(task.task_id)
+                task_depth = int(match.group(1))
+                # the sum of each stages after this task + itself
+                correct_weight = ((task_depth) * width + 1) * weight
+
+                calculated_weight = task.priority_weight_total
+                self.assertEquals(calculated_weight, correct_weight)
+
+        # Same test as above except use 'absolute' for weight calculation
+        weight = 10
+        with DAG('dag', start_date=DEFAULT_DATE,
+                 default_args={'owner': 'owner1'}) as dag:
+            pipeline = [
+                [DummyOperator(
+                    task_id='stage{}.{}'.format(i, j), priority_weight=weight,
+                    weight_rule=WeightRule.ABSOLUTE)
+                    for j in range(0, width)] for i in range(0, depth)
+            ]
+            for d, stage in enumerate(pipeline):
+                if d == 0:
+                    continue
+                for current_task in stage:
+                    for prev_task in pipeline[d - 1]:
+                        current_task.set_upstream(prev_task)
+
+            for task in six.itervalues(dag.task_dict):
+                match = pattern.match(task.task_id)
+                task_depth = int(match.group(1))
+                # the sum of each stages after this task + itself
+                correct_weight = weight
+
+                calculated_weight = task.priority_weight_total
+                self.assertEquals(calculated_weight, correct_weight)
+
+        # Test if we enter an invalid weight rule
+        with DAG('dag', start_date=DEFAULT_DATE,
+                 default_args={'owner': 'owner1'}) as dag:
+            with self.assertRaises(AirflowException):
+                DummyOperator(task_id='should_fail', weight_rule='no rule')
+
 
     def test_get_num_task_instances(self):
         test_dag_id = 'test_get_num_task_instances_dag'
@@ -320,7 +416,7 @@ class DagStatTest(unittest.TestCase):
         with dag:
             op1 = DummyOperator(task_id='A')
 
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
         dr = dag.create_dagrun(
             run_id='manual__' + now.isoformat(),
             execution_date=now,
@@ -345,7 +441,7 @@ class DagStatTest(unittest.TestCase):
 class DagRunTest(unittest.TestCase):
 
     def create_dag_run(self, dag, state=State.RUNNING, task_states=None, execution_date=None):
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
         if execution_date is None:
             execution_date = now
         dag_run = dag.create_dagrun(
@@ -367,14 +463,14 @@ class DagRunTest(unittest.TestCase):
 
     def test_id_for_date(self):
         run_id = models.DagRun.id_for_date(
-            datetime.datetime(2015, 1, 2, 3, 4, 5, 6, None))
+            timezone.datetime(2015, 1, 2, 3, 4, 5, 6))
         self.assertEqual(
             'scheduled__2015-01-02T03:04:05', run_id,
             'Generated run_id did not match expectations: {0}'.format(run_id))
 
     def test_dagrun_find(self):
         session = settings.Session()
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
 
         dag_id1 = "test_dagrun_find_externally_triggered"
         dag_run = models.DagRun(
@@ -411,7 +507,7 @@ class DagRunTest(unittest.TestCase):
         """
         dag = DAG(
             dag_id='test_dagrun_success_when_all_skipped',
-            start_date=datetime.datetime(2017, 1, 1)
+            start_date=timezone.datetime(2017, 1, 1)
         )
         dag_task1 = ShortCircuitOperator(
             task_id='test_short_circuit_false',
@@ -459,7 +555,7 @@ class DagRunTest(unittest.TestCase):
 
         dag.clear()
 
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
         dr = dag.create_dagrun(run_id='test_dagrun_success_conditions',
                                state=State.RUNNING,
                                execution_date=now,
@@ -498,7 +594,7 @@ class DagRunTest(unittest.TestCase):
             op2.set_upstream(op1)
 
         dag.clear()
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
         dr = dag.create_dagrun(run_id='test_dagrun_deadlock',
                                state=State.RUNNING,
                                execution_date=now,
@@ -550,13 +646,75 @@ class DagRunTest(unittest.TestCase):
         self.assertEqual(dr.state, State.RUNNING)
         self.assertEqual(dr2.state, State.RUNNING)
 
+    def test_dagrun_success_callback(self):
+        def on_success_callable(context):
+            self.assertEqual(
+                context['dag_run'].dag_id,
+                'test_dagrun_success_callback'
+            )
+
+        dag = DAG(
+            dag_id='test_dagrun_success_callback',
+            start_date=datetime.datetime(2017, 1, 1),
+            on_success_callback=on_success_callable,
+        )
+        dag_task1 = DummyOperator(
+            task_id='test_state_succeeded1',
+            dag=dag)
+        dag_task2 = DummyOperator(
+            task_id='test_state_succeeded2',
+            dag=dag)
+        dag_task1.set_downstream(dag_task2)
+
+        initial_task_states = {
+            'test_state_succeeded1': State.SUCCESS,
+            'test_state_succeeded2': State.SUCCESS,
+        }
+
+        dag_run = self.create_dag_run(dag=dag,
+                                      state=State.RUNNING,
+                                      task_states=initial_task_states)
+        updated_dag_state = dag_run.update_state()
+        self.assertEqual(State.SUCCESS, updated_dag_state)
+
+    def test_dagrun_failure_callback(self):
+        def on_failure_callable(context):
+            self.assertEqual(
+                context['dag_run'].dag_id,
+                'test_dagrun_failure_callback'
+            )
+
+        dag = DAG(
+            dag_id='test_dagrun_failure_callback',
+            start_date=datetime.datetime(2017, 1, 1),
+            on_failure_callback=on_failure_callable,
+        )
+        dag_task1 = DummyOperator(
+            task_id='test_state_succeeded1',
+            dag=dag)
+        dag_task2 = DummyOperator(
+            task_id='test_state_failed2',
+            dag=dag)
+
+        initial_task_states = {
+            'test_state_succeeded1': State.SUCCESS,
+            'test_state_failed2': State.FAILED,
+        }
+        dag_task1.set_downstream(dag_task2)
+
+        dag_run = self.create_dag_run(dag=dag,
+                                      state=State.RUNNING,
+                                      task_states=initial_task_states)
+        updated_dag_state = dag_run.update_state()
+        self.assertEqual(State.FAILED, updated_dag_state)
+
     def test_get_task_instance_on_empty_dagrun(self):
         """
         Make sure that a proper value is returned when a dagrun has no task instances
         """
         dag = DAG(
             dag_id='test_get_task_instance_on_empty_dagrun',
-            start_date=datetime.datetime(2017, 1, 1)
+            start_date=timezone.datetime(2017, 1, 1)
         )
         dag_task1 = ShortCircuitOperator(
             task_id='test_short_circuit_false',
@@ -565,7 +723,7 @@ class DagRunTest(unittest.TestCase):
 
         session = settings.Session()
 
-        now = datetime.datetime.now()
+        now = timezone.utcnow()
 
         # Don't use create_dagrun since it will create the task instances too which we
         # don't want
@@ -589,14 +747,14 @@ class DagRunTest(unittest.TestCase):
             dag_id='test_latest_runs_1',
             start_date=DEFAULT_DATE)
         dag_1_run_1 = self.create_dag_run(dag,
-                execution_date=datetime.datetime(2015, 1, 1))
+                execution_date=timezone.datetime(2015, 1, 1))
         dag_1_run_2 = self.create_dag_run(dag,
-                execution_date=datetime.datetime(2015, 1, 2))
+                execution_date=timezone.datetime(2015, 1, 2))
         dagruns = models.DagRun.get_latest_runs(session)
         session.close()
         for dagrun in dagruns:
             if dagrun.dag_id == 'test_latest_runs_1':
-                self.assertEqual(dagrun.execution_date, datetime.datetime(2015, 1, 2))
+                self.assertEqual(dagrun.execution_date, timezone.datetime(2015, 1, 2))
 
     def test_is_backfill(self):
         dag = DAG(dag_id='test_is_backfill', start_date=DEFAULT_DATE)
@@ -699,6 +857,14 @@ class DagBagTest(unittest.TestCase):
             self.assertTrue(
                 dag.fileloc.endswith('airflow/example_dags/' + path))
 
+    def test_process_file_with_none(self):
+        """
+        test that process_file can handle Nones
+        """
+        dagbag = models.DagBag(include_examples=True)
+
+        self.assertEqual([], dagbag.process_file(None))
+
 
 class TaskInstanceTest(unittest.TestCase):
 
@@ -740,6 +906,29 @@ class TaskInstanceTest(unittest.TestCase):
         self.assertTrue(
             op3.end_date == DEFAULT_DATE + datetime.timedelta(days=9))
 
+    def test_timezone_awareness(self):
+        NAIVE_DATETIME = DEFAULT_DATE.replace(tzinfo=None)
+
+        # check ti without dag (just for bw compat)
+        op_no_dag = DummyOperator(task_id='op_no_dag')
+        ti = TI(task=op_no_dag, execution_date=NAIVE_DATETIME)
+
+        self.assertEquals(ti.execution_date, DEFAULT_DATE)
+
+        # check with dag without localized execution_date
+        dag = DAG('dag', start_date=DEFAULT_DATE)
+        op1 = DummyOperator(task_id='op_1')
+        dag.add_task(op1)
+        ti = TI(task=op1, execution_date=NAIVE_DATETIME)
+
+        self.assertEquals(ti.execution_date, DEFAULT_DATE)
+
+        # with dag and localized execution_date
+        tz = pendulum.timezone("Europe/Amsterdam")
+        execution_date = timezone.datetime(2016, 1, 1, 1, 0, 0, tzinfo=tz)
+        utc_date = timezone.convert_to_utc(execution_date)
+        ti = TI(task=op1, execution_date=execution_date)
+        self.assertEquals(ti.execution_date, utc_date)
 
     def test_set_dag(self):
         """
@@ -835,7 +1024,7 @@ class TaskInstanceTest(unittest.TestCase):
                   max_active_runs=1, concurrency=2)
         task = DummyOperator(task_id='test_requeue_over_concurrency_op', dag=dag)
 
-        ti = TI(task=task, execution_date=datetime.datetime.now())
+        ti = TI(task=task, execution_date=timezone.utcnow())
         ti.run()
         self.assertEqual(ti.state, models.State.NONE)
 
@@ -852,9 +1041,9 @@ class TaskInstanceTest(unittest.TestCase):
         dag = models.DAG(dag_id='test_run_pooling_task')
         task = DummyOperator(task_id='test_run_pooling_task_op', dag=dag,
                              pool='test_run_pooling_task_pool', owner='airflow',
-                             start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+                             start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
         ti.run()
         self.assertEqual(ti.state, models.State.SUCCESS)
 
@@ -873,9 +1062,9 @@ class TaskInstanceTest(unittest.TestCase):
             dag=dag,
             pool='test_run_pooling_task_with_mark_success_pool',
             owner='airflow',
-            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
         ti.run(mark_success=True)
         self.assertEqual(ti.state, models.State.SUCCESS)
 
@@ -894,9 +1083,9 @@ class TaskInstanceTest(unittest.TestCase):
             dag=dag,
             python_callable=raise_skip_exception,
             owner='airflow',
-            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
         ti.run()
         self.assertEqual(models.State.SKIPPED, ti.state)
 
@@ -912,7 +1101,7 @@ class TaskInstanceTest(unittest.TestCase):
             retry_delay=datetime.timedelta(seconds=3),
             dag=dag,
             owner='airflow',
-            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
 
         def run_with_error(ti):
             try:
@@ -921,12 +1110,13 @@ class TaskInstanceTest(unittest.TestCase):
                 pass
 
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
 
+        self.assertEqual(ti.try_number, 1)
         # first run -- up for retry
         run_with_error(ti)
         self.assertEqual(ti.state, State.UP_FOR_RETRY)
-        self.assertEqual(ti.try_number, 1)
+        self.assertEqual(ti.try_number, 2)
 
         # second run -- still up for retry because retry_delay hasn't expired
         run_with_error(ti)
@@ -953,7 +1143,7 @@ class TaskInstanceTest(unittest.TestCase):
             retry_delay=datetime.timedelta(seconds=0),
             dag=dag,
             owner='airflow',
-            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
 
         def run_with_error(ti):
             try:
@@ -962,17 +1152,20 @@ class TaskInstanceTest(unittest.TestCase):
                 pass
 
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
+        self.assertEqual(ti.try_number, 1)
 
         # first run -- up for retry
         run_with_error(ti)
         self.assertEqual(ti.state, State.UP_FOR_RETRY)
-        self.assertEqual(ti.try_number, 1)
+        self.assertEqual(ti._try_number, 1)
+        self.assertEqual(ti.try_number, 2)
 
         # second run -- fail
         run_with_error(ti)
         self.assertEqual(ti.state, State.FAILED)
-        self.assertEqual(ti.try_number, 2)
+        self.assertEqual(ti._try_number, 2)
+        self.assertEqual(ti.try_number, 3)
 
         # Clear the TI state since you can't run a task with a FAILED state without
         # clearing it first
@@ -981,12 +1174,15 @@ class TaskInstanceTest(unittest.TestCase):
         # third run -- up for retry
         run_with_error(ti)
         self.assertEqual(ti.state, State.UP_FOR_RETRY)
-        self.assertEqual(ti.try_number, 3)
+        self.assertEqual(ti._try_number, 3)
+        self.assertEqual(ti.try_number, 4)
 
         # fourth run -- fail
         run_with_error(ti)
+        ti.refresh_from_db()
         self.assertEqual(ti.state, State.FAILED)
-        self.assertEqual(ti.try_number, 4)
+        self.assertEqual(ti._try_number, 4)
+        self.assertEqual(ti.try_number, 5)
 
     def test_next_retry_datetime(self):
         delay = datetime.timedelta(seconds=30)
@@ -1002,25 +1198,27 @@ class TaskInstanceTest(unittest.TestCase):
             max_retry_delay=max_delay,
             dag=dag,
             owner='airflow',
-            start_date=datetime.datetime(2016, 2, 1, 0, 0, 0))
+            start_date=timezone.datetime(2016, 2, 1, 0, 0, 0))
         ti = TI(
             task=task, execution_date=DEFAULT_DATE)
-        ti.end_date = datetime.datetime.now()
+        ti.end_date = pendulum.instance(timezone.utcnow())
 
-        ti.try_number = 1
         dt = ti.next_retry_datetime()
         # between 30 * 2^0.5 and 30 * 2^1 (15 and 30)
-        self.assertEqual(dt, ti.end_date + datetime.timedelta(seconds=20.0))
+        period = ti.end_date.add(seconds=30) - ti.end_date.add(seconds=15)
+        self.assertTrue(dt in period)
 
-        ti.try_number = 4
+        ti.try_number = 3
         dt = ti.next_retry_datetime()
         # between 30 * 2^2 and 30 * 2^3 (120 and 240)
-        self.assertEqual(dt, ti.end_date + datetime.timedelta(seconds=181.0))
+        period = ti.end_date.add(seconds=240) - ti.end_date.add(seconds=120)
+        self.assertTrue(dt in period)
 
-        ti.try_number = 6
+        ti.try_number = 5
         dt = ti.next_retry_datetime()
         # between 30 * 2^4 and 30 * 2^5 (480 and 960)
-        self.assertEqual(dt, ti.end_date + datetime.timedelta(seconds=825.0))
+        period = ti.end_date.add(seconds=960) - ti.end_date.add(seconds=480)
+        self.assertTrue(dt in period)
 
         ti.try_number = 9
         dt = ti.next_retry_datetime()
@@ -1099,7 +1297,7 @@ class TaskInstanceTest(unittest.TestCase):
                                      failed, upstream_failed, done,
                                      flag_upstream_failed,
                                      expect_state, expect_completed):
-        start_date = datetime.datetime(2016, 2, 1, 0, 0, 0)
+        start_date = timezone.datetime(2016, 2, 1, 0, 0, 0)
         dag = models.DAG('test-dag', start_date=start_date)
         downstream = DummyOperator(task_id='downstream',
                                    dag=dag, owner='airflow',
@@ -1124,6 +1322,43 @@ class TaskInstanceTest(unittest.TestCase):
         self.assertEqual(completed, expect_completed)
         self.assertEqual(ti.state, expect_state)
 
+    def test_xcom_pull(self):
+        """
+        Test xcom_pull, using different filtering methods.
+        """
+        dag = models.DAG(
+            dag_id='test_xcom', schedule_interval='@monthly',
+            start_date=timezone.datetime(2016, 6, 1, 0, 0, 0))
+
+        exec_date = timezone.utcnow()
+
+        # Push a value
+        task1 = DummyOperator(task_id='test_xcom_1', dag=dag, owner='airflow')
+        ti1 = TI(task=task1, execution_date=exec_date)
+        ti1.xcom_push(key='foo', value='bar')
+
+        # Push another value with the same key (but by a different task)
+        task2 = DummyOperator(task_id='test_xcom_2', dag=dag, owner='airflow')
+        ti2 = TI(task=task2, execution_date=exec_date)
+        ti2.xcom_push(key='foo', value='baz')
+
+        # Pull with no arguments
+        result = ti1.xcom_pull()
+        self.assertEqual(result, None)
+        # Pull the value pushed most recently by any task.
+        result = ti1.xcom_pull(key='foo')
+        self.assertIn(result, 'baz')
+        # Pull the value pushed by the first task
+        result = ti1.xcom_pull(task_ids='test_xcom_1', key='foo')
+        self.assertEqual(result, 'bar')
+        # Pull the value pushed by the second task
+        result = ti1.xcom_pull(task_ids='test_xcom_2', key='foo')
+        self.assertEqual(result, 'baz')
+        # Pull the values pushed by both tasks
+        result = ti1.xcom_pull(
+            task_ids=['test_xcom_1', 'test_xcom_2'], key='foo')
+        self.assertEqual(result, ('bar', 'baz'))
+
     def test_xcom_pull_after_success(self):
         """
         tests xcom set/clear relative to a task in a 'success' rerun scenario
@@ -1137,8 +1372,8 @@ class TaskInstanceTest(unittest.TestCase):
             dag=dag,
             pool='test_xcom',
             owner='airflow',
-            start_date=datetime.datetime(2016, 6, 2, 0, 0, 0))
-        exec_date = datetime.datetime.now()
+            start_date=timezone.datetime(2016, 6, 2, 0, 0, 0))
+        exec_date = timezone.utcnow()
         ti = TI(
             task=task, execution_date=exec_date)
         ti.run(mark_success=True)
@@ -1171,8 +1406,8 @@ class TaskInstanceTest(unittest.TestCase):
             dag=dag,
             pool='test_xcom',
             owner='airflow',
-            start_date=datetime.datetime(2016, 6, 2, 0, 0, 0))
-        exec_date = datetime.datetime.now()
+            start_date=timezone.datetime(2016, 6, 2, 0, 0, 0))
+        exec_date = timezone.utcnow()
         ti = TI(
             task=task, execution_date=exec_date)
         ti.run(mark_success=True)
@@ -1213,8 +1448,8 @@ class TaskInstanceTest(unittest.TestCase):
             dag=dag,
             python_callable=lambda: 'error',
             owner='airflow',
-            start_date=datetime.datetime(2017, 2, 1))
-        ti = TI(task=task, execution_date=datetime.datetime.now())
+            start_date=timezone.datetime(2017, 2, 1))
+        ti = TI(task=task, execution_date=timezone.utcnow())
 
         with self.assertRaises(TestError):
             ti.run()
@@ -1223,8 +1458,12 @@ class TaskInstanceTest(unittest.TestCase):
         dag = models.DAG(dag_id='test_check_and_change_state_before_execution')
         task = DummyOperator(task_id='task', dag=dag, start_date=DEFAULT_DATE)
         ti = TI(
-            task=task, execution_date=datetime.datetime.now())
+            task=task, execution_date=timezone.utcnow())
+        self.assertEqual(ti._try_number, 0)
         self.assertTrue(ti._check_and_change_state_before_execution())
+        # State should be running, and try_number column should be incremented
+        self.assertEqual(ti.state, State.RUNNING)
+        self.assertEqual(ti._try_number, 1)
 
     def test_check_and_change_state_before_execution_dep_not_met(self):
         dag = models.DAG(dag_id='test_check_and_change_state_before_execution')
@@ -1232,8 +1471,22 @@ class TaskInstanceTest(unittest.TestCase):
         task2= DummyOperator(task_id='task2', dag=dag, start_date=DEFAULT_DATE)
         task >> task2
         ti = TI(
-            task=task2, execution_date=datetime.datetime.now())
+            task=task2, execution_date=timezone.utcnow())
         self.assertFalse(ti._check_and_change_state_before_execution())
+
+    def test_try_number(self):
+        """
+        Test the try_number accessor behaves in various running states
+        """
+        dag = models.DAG(dag_id='test_check_and_change_state_before_execution')
+        task = DummyOperator(task_id='task', dag=dag, start_date=DEFAULT_DATE)
+        ti = TI(task=task, execution_date=timezone.utcnow())
+        self.assertEqual(1, ti.try_number)
+        ti.try_number = 2
+        ti.state = State.RUNNING
+        self.assertEqual(2, ti.try_number)
+        ti.state = State.SUCCESS
+        self.assertEqual(3, ti.try_number)
 
     def test_get_num_running_task_instances(self):
         session = settings.Session()
@@ -1257,7 +1510,31 @@ class TaskInstanceTest(unittest.TestCase):
         self.assertEquals(1, ti1.get_num_running_task_instances(session=session))
         self.assertEquals(1, ti2.get_num_running_task_instances(session=session))
         self.assertEquals(1, ti3.get_num_running_task_instances(session=session))
-        
+
+    def test_log_url(self):
+        now = pendulum.now('Europe/Brussels')
+        dag = DAG('dag', start_date=DEFAULT_DATE)
+        task = DummyOperator(task_id='op', dag=dag)
+        ti = TI(task=task, execution_date=now)
+        d = urllib.parse.parse_qs(
+            urllib.parse.urlparse(ti.log_url).query,
+            keep_blank_values=True, strict_parsing=True)
+        self.assertEqual(d['dag_id'][0], 'dag')
+        self.assertEqual(d['task_id'][0], 'op')
+        self.assertEqual(pendulum.parse(d['execution_date'][0]), now)
+
+    def test_mark_success_url(self):
+        now = pendulum.now('Europe/Brussels')
+        dag = DAG('dag', start_date=DEFAULT_DATE)
+        task = DummyOperator(task_id='op', dag=dag)
+        ti = TI(task=task, execution_date=now)
+        d = urllib.parse.parse_qs(
+            urllib.parse.urlparse(ti.mark_success_url).query,
+            keep_blank_values=True, strict_parsing=True)
+        self.assertEqual(d['dag_id'][0], 'dag')
+        self.assertEqual(d['task_id'][0], 'op')
+        self.assertEqual(pendulum.parse(d['execution_date'][0]), now)
+
 
 class ClearTasksTest(unittest.TestCase):
     def test_clear_task_instances(self):
@@ -1277,9 +1554,10 @@ class ClearTasksTest(unittest.TestCase):
         session.commit()
         ti0.refresh_from_db()
         ti1.refresh_from_db()
-        self.assertEqual(ti0.try_number, 1)
+        # Next try to run will be try 2
+        self.assertEqual(ti0.try_number, 2)
         self.assertEqual(ti0.max_tries, 1)
-        self.assertEqual(ti1.try_number, 1)
+        self.assertEqual(ti1.try_number, 2)
         self.assertEqual(ti1.max_tries, 3)
 
     def test_clear_task_instances_without_task(self):
@@ -1305,9 +1583,10 @@ class ClearTasksTest(unittest.TestCase):
         # When dag is None, max_tries will be maximum of original max_tries or try_number.
         ti0.refresh_from_db()
         ti1.refresh_from_db()
-        self.assertEqual(ti0.try_number, 1)
+        # Next try to run will be try 2
+        self.assertEqual(ti0.try_number, 2)
         self.assertEqual(ti0.max_tries, 1)
-        self.assertEqual(ti1.try_number, 1)
+        self.assertEqual(ti1.try_number, 2)
         self.assertEqual(ti1.max_tries, 2)
 
     def test_clear_task_instances_without_dag(self):
@@ -1328,9 +1607,10 @@ class ClearTasksTest(unittest.TestCase):
         # When dag is None, max_tries will be maximum of original max_tries or try_number.
         ti0.refresh_from_db()
         ti1.refresh_from_db()
-        self.assertEqual(ti0.try_number, 1)
+        # Next try to run will be try 2
+        self.assertEqual(ti0.try_number, 2)
         self.assertEqual(ti0.max_tries, 1)
-        self.assertEqual(ti1.try_number, 1)
+        self.assertEqual(ti1.try_number, 2)
         self.assertEqual(ti1.max_tries, 2)
 
     def test_dag_clear(self):
@@ -1338,12 +1618,13 @@ class ClearTasksTest(unittest.TestCase):
                   end_date=DEFAULT_DATE + datetime.timedelta(days=10))
         task0 = DummyOperator(task_id='test_dag_clear_task_0', owner='test', dag=dag)
         ti0 = TI(task=task0, execution_date=DEFAULT_DATE)
-        self.assertEqual(ti0.try_number, 0)
-        ti0.run()
+        # Next try to run will be try 1
         self.assertEqual(ti0.try_number, 1)
+        ti0.run()
+        self.assertEqual(ti0.try_number, 2)
         dag.clear()
         ti0.refresh_from_db()
-        self.assertEqual(ti0.try_number, 1)
+        self.assertEqual(ti0.try_number, 2)
         self.assertEqual(ti0.state, State.NONE)
         self.assertEqual(ti0.max_tries, 1)
 
@@ -1352,8 +1633,9 @@ class ClearTasksTest(unittest.TestCase):
         ti1 = TI(task=task1, execution_date=DEFAULT_DATE)
         self.assertEqual(ti1.max_tries, 2)
         ti1.try_number = 1
+        # Next try will be 2
         ti1.run()
-        self.assertEqual(ti1.try_number, 2)
+        self.assertEqual(ti1.try_number, 3)
         self.assertEqual(ti1.max_tries, 2)
 
         dag.clear()
@@ -1361,9 +1643,9 @@ class ClearTasksTest(unittest.TestCase):
         ti1.refresh_from_db()
         # after clear dag, ti2 should show attempt 3 of 5
         self.assertEqual(ti1.max_tries, 4)
-        self.assertEqual(ti1.try_number, 2)
+        self.assertEqual(ti1.try_number, 3)
         # after clear dag, ti1 should show attempt 2 of 2
-        self.assertEqual(ti0.try_number, 1)
+        self.assertEqual(ti0.try_number, 2)
         self.assertEqual(ti0.max_tries, 1)
 
     def test_dags_clear(self):
@@ -1383,7 +1665,7 @@ class ClearTasksTest(unittest.TestCase):
         for i in range(num_of_dags):
             tis[i].run()
             self.assertEqual(tis[i].state, State.SUCCESS)
-            self.assertEqual(tis[i].try_number, 1)
+            self.assertEqual(tis[i].try_number, 2)
             self.assertEqual(tis[i].max_tries, 0)
 
         DAG.clear_dags(dags)
@@ -1391,14 +1673,14 @@ class ClearTasksTest(unittest.TestCase):
         for i in range(num_of_dags):
             tis[i].refresh_from_db()
             self.assertEqual(tis[i].state, State.NONE)
-            self.assertEqual(tis[i].try_number, 1)
+            self.assertEqual(tis[i].try_number, 2)
             self.assertEqual(tis[i].max_tries, 1)
 
         # test dry_run
         for i in range(num_of_dags):
             tis[i].run()
             self.assertEqual(tis[i].state, State.SUCCESS)
-            self.assertEqual(tis[i].try_number, 2)
+            self.assertEqual(tis[i].try_number, 3)
             self.assertEqual(tis[i].max_tries, 1)
 
         DAG.clear_dags(dags, dry_run=True)
@@ -1406,7 +1688,7 @@ class ClearTasksTest(unittest.TestCase):
         for i in range(num_of_dags):
             tis[i].refresh_from_db()
             self.assertEqual(tis[i].state, State.SUCCESS)
-            self.assertEqual(tis[i].try_number, 2)
+            self.assertEqual(tis[i].try_number, 3)
             self.assertEqual(tis[i].max_tries, 1)
 
         # test only_failed
@@ -1422,11 +1704,11 @@ class ClearTasksTest(unittest.TestCase):
             tis[i].refresh_from_db()
             if i != failed_dag_idx:
                 self.assertEqual(tis[i].state, State.SUCCESS)
-                self.assertEqual(tis[i].try_number, 2)
+                self.assertEqual(tis[i].try_number, 3)
                 self.assertEqual(tis[i].max_tries, 1)
             else:
                 self.assertEqual(tis[i].state, State.NONE)
-                self.assertEqual(tis[i].try_number, 2)
+                self.assertEqual(tis[i].try_number, 3)
                 self.assertEqual(tis[i].max_tries, 2)
 
     def test_operator_clear(self):
@@ -1441,23 +1723,23 @@ class ClearTasksTest(unittest.TestCase):
         ti2 = TI(task=t2, execution_date=DEFAULT_DATE)
         ti2.run()
         # Dependency not met
-        self.assertEqual(ti2.try_number, 0)
+        self.assertEqual(ti2.try_number, 1)
         self.assertEqual(ti2.max_tries, 1)
 
         t2.clear(upstream=True)
         ti1.run()
         ti2.run()
-        self.assertEqual(ti1.try_number, 1)
+        self.assertEqual(ti1.try_number, 2)
         # max_tries is 0 because there is no task instance in db for ti1
         # so clear won't change the max_tries.
         self.assertEqual(ti1.max_tries, 0)
-        self.assertEqual(ti2.try_number, 1)
+        self.assertEqual(ti2.try_number, 2)
         # try_number (0) + retries(1)
         self.assertEqual(ti2.max_tries, 1)
 
     def test_xcom_disable_pickle_type(self):
         json_obj = {"key": "value"}
-        execution_date = datetime.datetime.now()
+        execution_date = timezone.utcnow()
         key = "xcom_test1"
         dag_id = "test_dag1"
         task_id = "test_task1"
@@ -1479,7 +1761,7 @@ class ClearTasksTest(unittest.TestCase):
 
     def test_xcom_enable_pickle_type(self):
         json_obj = {"key": "value"}
-        execution_date = datetime.datetime.now()
+        execution_date = timezone.utcnow()
         key = "xcom_test2"
         dag_id = "test_dag2"
         task_id = "test_task2"
@@ -1508,12 +1790,12 @@ class ClearTasksTest(unittest.TestCase):
                           value=PickleRce(),
                           dag_id="test_dag3",
                           task_id="test_task3",
-                          execution_date=datetime.datetime.now(),
+                          execution_date=timezone.utcnow(),
                           enable_pickling=False)
 
     def test_xcom_get_many(self):
         json_obj = {"key": "value"}
-        execution_date = datetime.datetime.now()
+        execution_date = timezone.utcnow()
         key = "xcom_test4"
         dag_id1 = "test_dag4"
         task_id1 = "test_task4"
@@ -1540,3 +1822,26 @@ class ClearTasksTest(unittest.TestCase):
 
         for result in results:
             self.assertEqual(result.value, json_obj)
+
+class ConnectionTest(unittest.TestCase):
+    @patch.object(configuration, 'get')
+    def test_connection_extra_no_encryption(self, mock_get):
+        """
+        Tests extras on a new connection without encryption. The fernet key
+        is set to a non-base64-encoded string and the extra is stored without
+        encryption.
+        """
+        mock_get.return_value = 'cryptography_not_found_storing_passwords_in_plain_text'
+        test_connection = Connection(extra='testextra')
+        self.assertEqual(test_connection.extra, 'testextra')
+
+    @patch.object(configuration, 'get')
+    def test_connection_extra_with_encryption(self, mock_get):
+        """
+        Tests extras on a new connection with encryption. The fernet key
+        is set to a base64 encoded string and the extra is encrypted.
+        """
+        # 'dGVzdA==' is base64 encoded 'test'
+        mock_get.return_value = 'dGVzdA=='
+        test_connection = Connection(extra='testextra')
+        self.assertEqual(test_connection.extra, 'testextra')

@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime
-
 from airflow.models import BaseOperator, DagBag
+from airflow.utils import timezone
 from airflow.utils.db import create_session
 from airflow.utils.decorators import apply_defaults
 from airflow.utils.state import State
@@ -29,7 +28,7 @@ class DagRunOrder(object):
 
 class TriggerDagRunOperator(BaseOperator):
     """
-    Triggers a DAG run for a specified ``dag_id`` if a criteria is met
+    Triggers a DAG run for a specified ``dag_id``
 
     :param trigger_dag_id: the dag_id to trigger
     :type trigger_dag_id: str
@@ -52,15 +51,16 @@ class TriggerDagRunOperator(BaseOperator):
     def __init__(
             self,
             trigger_dag_id,
-            python_callable,
+            python_callable=None,
             *args, **kwargs):
         super(TriggerDagRunOperator, self).__init__(*args, **kwargs)
         self.python_callable = python_callable
         self.trigger_dag_id = trigger_dag_id
 
     def execute(self, context):
-        dro = DagRunOrder(run_id='trig__' + datetime.utcnow().isoformat())
-        dro = self.python_callable(context, dro)
+        dro = DagRunOrder(run_id='trig__' + timezone.utcnow().isoformat())
+        if self.python_callable is not None:
+            dro = self.python_callable(context, dro)
         if dro:
             with create_session() as session:
                 dbag = DagBag(settings.DAGS_FOLDER)

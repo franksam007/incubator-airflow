@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import sys
 import unittest
+
 import re
 from datetime import timedelta
+
 from airflow.contrib.sensors.hdfs_sensors import HdfsSensorFolder, HdfsSensorRegex
 from airflow.exceptions import AirflowSensorTimeout
 
 
 class HdfsSensorFolderTests(unittest.TestCase):
     def setUp(self):
-        if sys.version_info[0] == 3:
-            raise unittest.SkipTest('HdfsSensor won\'t work with python3. No need to test anything here')
         from tests.core import FakeHDFSHook
         self.hook = FakeHDFSHook
         self.log = logging.getLogger()
@@ -120,8 +119,6 @@ class HdfsSensorFolderTests(unittest.TestCase):
 
 class HdfsSensorRegexTests(unittest.TestCase):
     def setUp(self):
-        if sys.version_info[0] == 3:
-            raise unittest.SkipTest('HdfsSensor won\'t work with python3. No need to test anything here')
         from tests.core import FakeHDFSHook
         self.hook = FakeHDFSHook
         self.log = logging.getLogger()
