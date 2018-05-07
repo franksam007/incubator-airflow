@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import io
 import copy
@@ -20,7 +25,9 @@ import shutil
 import tempfile
 import unittest
 import sys
+import json
 
+from urllib.parse import quote_plus
 from werkzeug.test import Client
 
 from airflow import models, configuration, settings
@@ -377,8 +384,23 @@ class TestLogView(unittest.TestCase):
             follow_redirects=True,
         )
         self.assertEqual(response.status_code, 200)
-        self.assertIn('Log file does not exist',
+        self.assertIn('Log by attempts',
                       response.data.decode('utf-8'))
+
+    def test_get_logs_with_metadata(self):
+        url_template = "/admin/airflow/get_logs_with_metadata?dag_id={}&" \
+                       "task_id={}&execution_date={}&" \
+                       "try_number={}&metadata={}"
+        response = \
+            self.app.get(url_template.format(self.DAG_ID,
+                                             self.TASK_ID,
+                                             quote_plus(self.DEFAULT_DATE.isoformat()),
+                                             1,
+                                             json.dumps({})))
+
+        self.assertIn('"message":', response.data.decode('utf-8'))
+        self.assertIn('"metadata":', response.data.decode('utf-8'))
+        self.assertEqual(200, response.status_code)
 
 
 class TestVarImportView(unittest.TestCase):
@@ -415,15 +437,35 @@ class TestVarImportView(unittest.TestCase):
         super(TestVarImportView, cls).tearDownClass()
 
     def test_import_variables(self):
+        content = ('{"str_key": "str_value", "int_key": 60,'
+                   '"list_key": [1, 2], "dict_key": {"k_a": 2, "k_b": 3}}')
+        try:
+            # python 3+
+            bytes_content = io.BytesIO(bytes(content, encoding='utf-8'))
+        except TypeError:
+            # python 2.7
+            bytes_content = io.BytesIO(bytes(content))
         response = self.app.post(
             self.IMPORT_ENDPOINT,
-            data={'file': (io.BytesIO(b'{"KEY": "VALUE"}'), 'test.json')},
+            data={'file': (bytes_content, 'test.json')},
             follow_redirects=True
         )
         self.assertEqual(response.status_code, 200)
         body = response.data.decode('utf-8')
-        self.assertIn('KEY', body)
-        self.assertIn('VALUE', body)
+        self.assertIn('str_key', body)
+        self.assertIn('int_key', body)
+        self.assertIn('list_key', body)
+        self.assertIn('dict_key', body)
+        self.assertIn('str_value', body)
+        self.assertIn('60', body)
+        self.assertIn('[1, 2]', body)
+        # As dicts are not ordered, we may get any of the following cases.
+        case_a_dict = '{&#34;k_a&#34;: 2, &#34;k_b&#34;: 3}'
+        case_b_dict = '{&#34;k_b&#34;: 3, &#34;k_a&#34;: 2}'
+        try:
+            self.assertIn(case_a_dict, body)
+        except AssertionError:
+            self.assertIn(case_b_dict, body)
 
 
 class TestMountPoint(unittest.TestCase):
@@ -433,6 +475,8 @@ class TestMountPoint(unittest.TestCase):
         configuration.conf.set("webserver", "base_url", "http://localhost:8080/test")
         config = dict()
         config['WTF_CSRF_METHODS'] = []
+        # Clear cached app to remount base_url forcefully
+        application.app = None
         app = application.cached_app(config=config, testing=True)
         self.client = Client(app)
 

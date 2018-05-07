@@ -1,29 +1,39 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 from __future__ import print_function
 import logging
 
-import reprlib
-
 import os
-import socket
 import subprocess
 import textwrap
+import random
+import string
 from importlib import import_module
 
+import daemon
+import psutil
+import re
+import getpass
+from urllib.parse import urlunparse
+import reprlib
 import argparse
 from builtins import input
 from collections import namedtuple
@@ -46,18 +56,22 @@ import airflow
 from airflow import api
 from airflow import jobs, settings
 from airflow import configuration as conf
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowWebServerTimeout
 from airflow.executors import GetDefaultExecutor
 from airflow.models import (DagModel, DagBag, TaskInstance,
                             DagPickle, DagRun, Variable, DagStat,
                             Connection, DAG)
 
 from airflow.ti_deps.dep_context import (DepContext, SCHEDULER_DEPS)
+from airflow.utils import cli as cli_utils
 from airflow.utils import db as db_utils
 from airflow.utils.net import get_hostname
 from airflow.utils.log.logging_mixin import (LoggingMixin, redirect_stderr,
-                                             redirect_stdout, set_context)
-from airflow.www.app import cached_app
+                                             redirect_stdout)
+from airflow.www.app import (cached_app, create_app)
+from airflow.www_rbac.app import cached_app as cached_app_rbac
+from airflow.www_rbac.app import create_app as create_app_rbac
+from airflow.www_rbac.app import cached_appbuilder
 
 from sqlalchemy import func
 from sqlalchemy.orm import exc
@@ -145,6 +159,7 @@ def get_dags(args):
     return matched_dags
 
 
+@cli_utils.action_logging
 def backfill(args, dag=None):
     logging.basicConfig(
         level=settings.LOGGING_LEVEL,
@@ -186,6 +201,7 @@ def backfill(args, dag=None):
             delay_on_limit_secs=args.delay_on_limit)
 
 
+@cli_utils.action_logging
 def trigger_dag(args):
     """
     Creates a dag run for the specified dag
@@ -204,6 +220,7 @@ def trigger_dag(args):
     log.info(message)
 
 
+@cli_utils.action_logging
 def delete_dag(args):
     """
     Deletes all DB records related to the specified dag
@@ -224,6 +241,7 @@ def delete_dag(args):
         print("Bail.")
 
 
+@cli_utils.action_logging
 def pool(args):
     log = LoggingMixin().log
 
@@ -248,6 +266,7 @@ def pool(args):
         log.info(_tabulate(pools=pools))
 
 
+@cli_utils.action_logging
 def variables(args):
     if args.get:
         try:
@@ -324,10 +343,12 @@ def export_helper(filepath):
     print("{} variables successfully exported to {}".format(len(var_dict), filepath))
 
 
+@cli_utils.action_logging
 def pause(args, dag=None):
     set_is_paused(True, args, dag)
 
 
+@cli_utils.action_logging
 def unpause(args, dag=None):
     set_is_paused(False, args, dag)
 
@@ -397,6 +418,7 @@ def _run(args, dag, ti):
         executor.end()
 
 
+@cli_utils.action_logging
 def run(args, dag=None):
     # Disable connection pooling to reduce the # of connections on the DB
     # while it's waiting for the task to finish.
@@ -444,17 +466,17 @@ def run(args, dag=None):
     if args.interactive:
         _run(args, dag, ti)
     else:
-        with redirect_stdout(ti.log, logging.INFO),\
-                redirect_stderr(ti.log, logging.WARN):
+        with redirect_stdout(ti.log, logging.INFO), redirect_stderr(ti.log, logging.WARN):
             _run(args, dag, ti)
-        logging.shutdown()
+    logging.shutdown()
 
+
+@cli_utils.action_logging
 def task_failed_deps(args):
     """
     Returns the unmet dependencies for a task instance from the perspective of the
     scheduler (i.e. why a task instance doesn't get scheduled and then queued by the
     scheduler, and then run by an executor).
-
     >>> airflow task_failed_deps tutorial sleep 2015-01-01
     Task instance dependencies not met:
     Dagrun Running: Task instance's dagrun did not exist: Unknown reason
@@ -475,10 +497,10 @@ def task_failed_deps(args):
         print("Task instance dependencies are all met.")
 
 
+@cli_utils.action_logging
 def task_state(args):
     """
     Returns the state of a TaskInstance at the command line.
-
     >>> airflow task_state tutorial sleep 2015-01-01
     success
     """
@@ -488,10 +510,10 @@ def task_state(args):
     print(ti.current_state())
 
 
+@cli_utils.action_logging
 def dag_state(args):
     """
     Returns the state of a DagRun at the command line.
-
     >>> airflow dag_state tutorial 2015-01-01T00:00:00.000000
     running
     """
@@ -500,6 +522,7 @@ def dag_state(args):
     print(dr[0].state if len(dr) > 0 else None)
 
 
+@cli_utils.action_logging
 def list_dags(args):
     dagbag = DagBag(process_subdir(args.subdir))
     s = textwrap.dedent("""\n
@@ -514,6 +537,7 @@ def list_dags(args):
         print(dagbag.dagbag_report())
 
 
+@cli_utils.action_logging
 def list_tasks(args, dag=None):
     dag = dag or get_dag(args)
     if args.tree:
@@ -523,6 +547,7 @@ def list_tasks(args, dag=None):
         print("\n".join(sorted(tasks)))
 
 
+@cli_utils.action_logging
 def test(args, dag=None):
     dag = dag or get_dag(args)
 
@@ -539,6 +564,7 @@ def test(args, dag=None):
         ti.run(ignore_task_deps=True, ignore_ti_state=True, test_mode=True)
 
 
+@cli_utils.action_logging
 def render(args):
     dag = get_dag(args)
     task = dag.get_task(task_id=args.task_id)
@@ -553,6 +579,7 @@ def render(args):
         """.format(attr, getattr(task, attr))))
 
 
+@cli_utils.action_logging
 def clear(args):
     logging.basicConfig(
         level=settings.LOGGING_LEVEL,
@@ -592,42 +619,44 @@ def get_num_ready_workers_running(gunicorn_master_proc):
     return len(ready_workers)
 
 
-def restart_workers(gunicorn_master_proc, num_workers_expected):
+def get_num_workers_running(gunicorn_master_proc):
+    workers = psutil.Process(gunicorn_master_proc.pid).children()
+    return len(workers)
+
+
+def restart_workers(gunicorn_master_proc, num_workers_expected, master_timeout):
     """
     Runs forever, monitoring the child processes of @gunicorn_master_proc and
     restarting workers occasionally.
-
     Each iteration of the loop traverses one edge of this state transition
     diagram, where each state (node) represents
     [ num_ready_workers_running / num_workers_running ]. We expect most time to
     be spent in [n / n]. `bs` is the setting webserver.worker_refresh_batch_size.
-
     The horizontal transition at ? happens after the new worker parses all the
     dags (so it could take a while!)
-
        V ────────────────────────────────────────────────────────────────────────┐
     [n / n] ──TTIN──> [ [n, n+bs) / n + bs ]  ────?───> [n + bs / n + bs] ──TTOU─┘
        ^                          ^───────────────┘
        │
        │      ┌────────────────v
        └──────┴────── [ [0, n) / n ] <─── start
-
     We change the number of workers by sending TTIN and TTOU to the gunicorn
     master process, which increases and decreases the number of child workers
     respectively. Gunicorn guarantees that on TTOU workers are terminated
     gracefully and that the oldest worker is terminated.
     """
 
-    def wait_until_true(fn):
+    def wait_until_true(fn, timeout=0):
         """
         Sleeps until fn is true
         """
+        t = time.time()
         while not fn():
+            if 0 < timeout and timeout <= time.time() - t:
+                raise AirflowWebServerTimeout(
+                    "No response from gunicorn master within {0} seconds"
+                    .format(timeout))
             time.sleep(0.1)
-
-    def get_num_workers_running(gunicorn_master_proc):
-        workers = psutil.Process(gunicorn_master_proc.pid).children()
-        return len(workers)
 
     def start_refresh(gunicorn_master_proc):
         batch_size = conf.getint('webserver', 'worker_refresh_batch_size')
@@ -640,61 +669,73 @@ def restart_workers(gunicorn_master_proc, num_workers_expected):
             gunicorn_master_proc.send_signal(signal.SIGTTIN)
             excess += 1
             wait_until_true(lambda: num_workers_expected + excess ==
-                                    get_num_workers_running(gunicorn_master_proc))
+                            get_num_workers_running(gunicorn_master_proc),
+                            master_timeout)
 
-    wait_until_true(lambda: num_workers_expected ==
-                            get_num_workers_running(gunicorn_master_proc))
+    try:
+        wait_until_true(lambda: num_workers_expected ==
+                        get_num_workers_running(gunicorn_master_proc),
+                        master_timeout)
+        while True:
+            num_workers_running = get_num_workers_running(gunicorn_master_proc)
+            num_ready_workers_running = \
+                get_num_ready_workers_running(gunicorn_master_proc)
 
-    while True:
-        num_workers_running = get_num_workers_running(gunicorn_master_proc)
-        num_ready_workers_running = get_num_ready_workers_running(gunicorn_master_proc)
+            state = '[{0} / {1}]'.format(num_ready_workers_running, num_workers_running)
 
-        state = '[{0} / {1}]'.format(num_ready_workers_running, num_workers_running)
+            # Whenever some workers are not ready, wait until all workers are ready
+            if num_ready_workers_running < num_workers_running:
+                log.debug('%s some workers are starting up, waiting...', state)
+                sys.stdout.flush()
+                time.sleep(1)
 
-        # Whenever some workers are not ready, wait until all workers are ready
-        if num_ready_workers_running < num_workers_running:
-            log.debug('%s some workers are starting up, waiting...', state)
-            sys.stdout.flush()
-            time.sleep(1)
+            # Kill a worker gracefully by asking gunicorn to reduce number of workers
+            elif num_workers_running > num_workers_expected:
+                excess = num_workers_running - num_workers_expected
+                log.debug('%s killing %s workers', state, excess)
 
-        # Kill a worker gracefully by asking gunicorn to reduce number of workers
-        elif num_workers_running > num_workers_expected:
-            excess = num_workers_running - num_workers_expected
-            log.debug('%s killing %s workers', state, excess)
+                for _ in range(excess):
+                    gunicorn_master_proc.send_signal(signal.SIGTTOU)
+                    excess -= 1
+                    wait_until_true(lambda: num_workers_expected + excess ==
+                                    get_num_workers_running(gunicorn_master_proc),
+                                    master_timeout)
 
-            for _ in range(excess):
-                gunicorn_master_proc.send_signal(signal.SIGTTOU)
-                excess -= 1
-                wait_until_true(lambda: num_workers_expected + excess ==
-                                        get_num_workers_running(gunicorn_master_proc))
-
-        # Start a new worker by asking gunicorn to increase number of workers
-        elif num_workers_running == num_workers_expected:
-            refresh_interval = conf.getint('webserver', 'worker_refresh_interval')
-            log.debug(
-                '%s sleeping for %ss starting doing a refresh...',
-                state, refresh_interval
-            )
-            time.sleep(refresh_interval)
-            start_refresh(gunicorn_master_proc)
-
-        else:
-            # num_ready_workers_running == num_workers_running < num_workers_expected
-            log.error((
-                "%s some workers seem to have died and gunicorn"
-                "did not restart them as expected"
-            ), state)
-            time.sleep(10)
-            if len(
-                psutil.Process(gunicorn_master_proc.pid).children()
-            ) < num_workers_expected:
+            # Start a new worker by asking gunicorn to increase number of workers
+            elif num_workers_running == num_workers_expected:
+                refresh_interval = conf.getint('webserver', 'worker_refresh_interval')
+                log.debug(
+                    '%s sleeping for %ss starting doing a refresh...',
+                    state, refresh_interval
+                )
+                time.sleep(refresh_interval)
                 start_refresh(gunicorn_master_proc)
 
+            else:
+                # num_ready_workers_running == num_workers_running < num_workers_expected
+                log.error((
+                    "%s some workers seem to have died and gunicorn"
+                    "did not restart them as expected"
+                ), state)
+                time.sleep(10)
+                if len(
+                    psutil.Process(gunicorn_master_proc.pid).children()
+                ) < num_workers_expected:
+                    start_refresh(gunicorn_master_proc)
+    except (AirflowWebServerTimeout, OSError) as err:
+        log.error(err)
+        log.error("Shutting down webserver")
+        try:
+            gunicorn_master_proc.terminate()
+            gunicorn_master_proc.wait()
+        finally:
+            sys.exit(1)
 
+
+@cli_utils.action_logging
 def webserver(args):
     print(settings.HEADER)
 
-    app = cached_app(conf)
     access_logfile = args.access_logfile or conf.get('webserver', 'access_logfile')
     error_logfile = args.error_logfile or conf.get('webserver', 'error_logfile')
     num_workers = args.workers or conf.get('webserver', 'workers')
@@ -713,10 +754,13 @@ def webserver(args):
         print(
             "Starting the web server on port {0} and host {1}.".format(
                 args.port, args.hostname))
+        app = create_app_rbac(conf) if settings.RBAC else create_app(conf)
         app.run(debug=True, port=args.port, host=args.hostname,
                 ssl_context=(ssl_cert, ssl_key) if ssl_cert and ssl_key else None)
     else:
-        pid, stdout, stderr, log_file = setup_locations("webserver", args.pid, args.stdout, args.stderr, args.log_file)
+        app = cached_app_rbac(conf) if settings.RBAC else cached_app(conf)
+        pid, stdout, stderr, log_file = setup_locations(
+            "webserver", args.pid, args.stdout, args.stderr, args.log_file)
         if args.daemon:
             handle = setup_logging(log_file)
             stdout = open(stdout, 'w+')
@@ -740,7 +784,7 @@ def webserver(args):
             '-b', args.hostname + ':' + str(args.port),
             '-n', 'airflow-webserver',
             '-p', str(pid),
-            '-c', 'python:airflow.www.gunicorn_config'
+            '-c', 'python:airflow.www.gunicorn_config',
         ]
 
         if args.access_logfile:
@@ -755,7 +799,8 @@ def webserver(args):
         if ssl_cert:
             run_args += ['--certfile', ssl_cert, '--keyfile', ssl_key]
 
-        run_args += ["airflow.www.app:cached_app()"]
+        webserver_module = 'www_rbac' if settings.RBAC else 'www'
+        run_args += ["airflow." + webserver_module + ".app:cached_app()"]
 
         gunicorn_master_proc = None
 
@@ -767,7 +812,8 @@ def webserver(args):
         def monitor_gunicorn(gunicorn_master_proc):
             # These run forever until SIG{INT, TERM, KILL, ...} signal is sent
             if conf.getint('webserver', 'worker_refresh_interval') > 0:
-                restart_workers(gunicorn_master_proc, num_workers)
+                master_timeout = conf.getint('webserver', 'web_server_master_timeout')
+                restart_workers(gunicorn_master_proc, num_workers, master_timeout)
             else:
                 while True:
                     time.sleep(1)
@@ -812,6 +858,7 @@ def webserver(args):
             monitor_gunicorn(gunicorn_master_proc)
 
 
+@cli_utils.action_logging
 def scheduler(args):
     print(settings.HEADER)
     job = jobs.SchedulerJob(
@@ -845,6 +892,7 @@ def scheduler(args):
         job.run()
 
 
+@cli_utils.action_logging
 def serve_logs(args):
     print("Starting flask")
     import flask
@@ -865,6 +913,7 @@ def serve_logs(args):
         host='0.0.0.0', port=WORKER_LOG_SERVER_PORT)
 
 
+@cli_utils.action_logging
 def worker(args):
     env = os.environ.copy()
     env['AIRFLOW_HOME'] = settings.AIRFLOW_HOME
@@ -911,22 +960,25 @@ def worker(args):
         sp.kill()
 
 
+@cli_utils.action_logging
 def initdb(args):  # noqa
     print("DB: " + repr(settings.engine.url))
-    db_utils.initdb()
+    db_utils.initdb(settings.RBAC)
     print("Done.")
 
 
+@cli_utils.action_logging
 def resetdb(args):
     print("DB: " + repr(settings.engine.url))
     if args.yes or input(
         "This will drop existing tables if they exist. "
         "Proceed? (y/n)").upper() == "Y":
-        db_utils.resetdb()
+        db_utils.resetdb(settings.RBAC)
     else:
         print("Bail.")
 
 
+@cli_utils.action_logging
 def upgradedb(args):  # noqa
     print("DB: " + repr(settings.engine.url))
     db_utils.upgradedb()
@@ -944,6 +996,7 @@ def upgradedb(args):  # noqa
         session.commit()
 
 
+@cli_utils.action_logging
 def version(args):  # noqa
     print(settings.HEADER + "  v" + airflow.__version__)
 
@@ -952,6 +1005,7 @@ alternative_conn_specs = ['conn_type', 'conn_host',
                           'conn_login', 'conn_password', 'conn_schema', 'conn_port']
 
 
+@cli_utils.action_logging
 def connections(args):
     if args.list:
         # Check that no other flags were passed to the command
@@ -973,9 +1027,12 @@ def connections(args):
                               Connection.is_extra_encrypted,
                               Connection.extra).all()
         conns = [map(reprlib.repr, conn) for conn in conns]
-        print(tabulate(conns, ['Conn Id', 'Conn Type', 'Host', 'Port',
+        msg = tabulate(conns, ['Conn Id', 'Conn Type', 'Host', 'Port',
                                'Is Encrypted', 'Is Extra Encrypted', 'Extra'],
-                       tablefmt="fancy_grid"))
+                       tablefmt="fancy_grid")
+        if sys.version_info[0] < 3:
+            msg = msg.encode('utf-8')
+        print(msg)
         return
 
     if args.delete:
@@ -1072,6 +1129,7 @@ def connections(args):
         return
 
 
+@cli_utils.action_logging
 def flower(args):
     broka = conf.get('celery', 'BROKER_URL')
     address = '--address={}'.format(args.hostname)
@@ -1113,12 +1171,17 @@ def flower(args):
                              broka, address, port, api, flower_conf, url_prefix])
 
 
+@cli_utils.action_logging
 def kerberos(args):  # noqa
     print(settings.HEADER)
     import airflow.security.kerberos
 
     if args.daemon:
-        pid, stdout, stderr, log_file = setup_locations("kerberos", args.pid, args.stdout, args.stderr, args.log_file)
+        pid, stdout, stderr, log_file = setup_locations("kerberos",
+                                                        args.pid,
+                                                        args.stdout,
+                                                        args.stderr,
+                                                        args.log_file)
         stdout = open(stdout, 'w+')
         stderr = open(stderr, 'w+')
 
@@ -1135,6 +1198,43 @@ def kerberos(args):  # noqa
         stderr.close()
     else:
         airflow.security.kerberos.run()
+
+
+@cli_utils.action_logging
+def create_user(args):
+    fields = {
+        'role': args.role,
+        'username': args.username,
+        'email': args.email,
+        'firstname': args.firstname,
+        'lastname': args.lastname,
+    }
+    empty_fields = [k for k, v in fields.items() if not v]
+    if empty_fields:
+        raise SystemExit('Required arguments are missing: {}.'.format(
+            ', '.join(empty_fields)))
+
+    appbuilder = cached_appbuilder()
+    role = appbuilder.sm.find_role(args.role)
+    if not role:
+        raise SystemExit('{} is not a valid role.'.format(args.role))
+
+    if args.use_random_password:
+        password = ''.join(random.choice(string.printable) for _ in range(16))
+    elif args.password:
+        password = args.password
+    else:
+        password = getpass.getpass('Password:')
+        password_confirmation = getpass.getpass('Repeat for confirmation:')
+        if password != password_confirmation:
+            raise SystemExit('Passwords did not match!')
+
+    user = appbuilder.sm.add_user(args.username, args.firstname, args.lastname,
+                                  args.email, role, password)
+    if user:
+        print('{} user {} created.'.format(args.role, args.username))
+    else:
+        raise SystemExit('Failed to create user.')
 
 
 Arg = namedtuple(
@@ -1502,6 +1602,37 @@ class CLIFactory(object):
             ('--conn_extra',),
             help='Connection `Extra` field, optional when adding a connection',
             type=str),
+        # create_user
+        'role': Arg(
+            ('-r', '--role',),
+            help='Role of the user. Existing roles include Admin, '
+                 'User, Op, Viewer, and Public',
+            type=str),
+        'firstname': Arg(
+            ('-f', '--firstname',),
+            help='First name of the user',
+            type=str),
+        'lastname': Arg(
+            ('-l', '--lastname',),
+            help='Last name of the user',
+            type=str),
+        'email': Arg(
+            ('-e', '--email',),
+            help='Email of the user',
+            type=str),
+        'username': Arg(
+            ('-u', '--username',),
+            help='Username of the user',
+            type=str),
+        'password': Arg(
+            ('-p', '--password',),
+            help='Password of the user',
+            type=str),
+        'use_random_password': Arg(
+            ('--use_random_password',),
+            help='Do not prompt for password.  Use random string instead',
+            default=False,
+            action='store_true'),
     }
     subparsers = (
         {
@@ -1639,6 +1770,11 @@ class CLIFactory(object):
             'help': "List/Add/Delete connections",
             'args': ('list_connections', 'add_connection', 'delete_connection',
                      'conn_id', 'conn_uri', 'conn_extra') + tuple(alternative_conn_specs),
+        }, {
+            'func': create_user,
+            'help': "Create an admin account",
+            'args': ('role', 'username', 'email', 'firstname', 'lastname',
+                     'password', 'use_random_password'),
         },
     )
     subparsers_dict = {sp['func'].__name__: sp for sp in subparsers}
