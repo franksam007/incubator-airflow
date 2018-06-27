@@ -49,7 +49,7 @@
   <div>
     <ul class="nav nav-pills">
       {% if dag.parent_dag %}
-          <li class="never_active"><a href="{{ url_for("airflow.graph", dag_id=dag.parent_dag.dag_id) }}">
+          <li class="never_active"><a href="{{ url_for('airflow.' + dag.default_view, dag_id=dag.parent_dag.dag_id) }}">
               <span class="glyphicon glyphicon-arrow-left" aria-hidden="true"></span>
               Back to {{ dag.parent_dag.dag_id }}</a>
           </li>
@@ -57,7 +57,7 @@
       <li><a href="{{ url_for("airflow.graph", dag_id=dag.dag_id, root=root, execution_date=execution_date) }}">
           <span class="glyphicon glyphicon-certificate" aria-hidden="true"></span>
         Graph View</a></li>
-      <li><a href="{{ url_for("airflow.tree", dag_id=dag.dag_id, num_runs=25, root=root) }}">
+      <li><a href="{{ url_for("airflow.tree", dag_id=dag.dag_id, num_runs=num_runs, root=root) }}">
           <span class="glyphicon glyphicon-tree-deciduous" aria-hidden="true"></span>
         Tree View
       </a></li>
@@ -98,6 +98,13 @@
         <a href="{{ url_for("airflow.refresh", dag_id=dag.dag_id) }}" title="Refresh">
           <span class="glyphicon glyphicon-refresh" aria-hidden="true"></span>
           Refresh
+        </a>
+      </li>
+      <li>
+        <a href="{{ url_for("airflow.delete", dag_id=dag.dag_id, root=root) }}"
+        onclick="return confirmDeleteDag('{{ dag.safe_dag_id }}')">
+        <span class="glyphicon glyphicon-remove-circle" style="color:red" aria-hidden="true"></span>
+        Delete
         </a>
       </li>
     </ul>
@@ -302,6 +309,12 @@ function updateQueryStringParameter(uri, key, value) {
       $("#dagModal").css("margin-top","0px");
     }
 
+    function confirmDeleteDag(dag_id){
+        return confirm("Are you sure you want to delete '"+dag_id+"' now?\n\
+          This option will delete ALL metadata, DAG runs, etc.\n\
+          This cannot be undone.");
+    }
+
     $("#btn_rendered").click(function(){
       url = "{{ url_for('airflow.rendered') }}" +
         "?task_id=" + encodeURIComponent(task_id) +
@@ -311,7 +324,7 @@ function updateQueryStringParameter(uri, key, value) {
     });
 
     $("#btn_subdag").click(function(){
-      url = "{{ url_for('airflow.graph') }}" +
+      url = "{{ url_for( 'airflow.' + dag.default_view ) }}" +
         "?dag_id=" + encodeURIComponent(subdag_id) +
         "&execution_date=" + encodeURIComponent(execution_date);
       window.location = url;
