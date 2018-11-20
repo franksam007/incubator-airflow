@@ -55,16 +55,18 @@ class LdapException(Exception):
 
 
 def get_ldap_connection(dn=None, password=None):
-    tls_configuration = None
-    use_ssl = False
     try:
         cacert = configuration.conf.get("ldap", "cacert")
-        tls_configuration = Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=cacert)
-        use_ssl = True
-    except Exception:
+    except AirflowConfigException:
         pass
 
-    server = Server(configuration.conf.get("ldap", "uri"), use_ssl, tls_configuration)
+    tls_configuration = Tls(validate=ssl.CERT_REQUIRED,
+                            ca_certs_file=cacert)
+
+    server = Server(configuration.conf.get("ldap", "uri"),
+                    use_ssl=True,
+                    tls=tls_configuration)
+
     conn = Connection(server, native(dn), native(password))
 
     if not conn.bind():
@@ -235,14 +237,17 @@ class LdapUser(models.User):
             log.info("Password incorrect for user %s", username)
             raise AuthenticationError("Invalid username or password")
 
+    @property
     def is_active(self):
         """Required by flask_login"""
         return True
 
+    @property
     def is_authenticated(self):
         """Required by flask_login"""
         return True
 
+    @property
     def is_anonymous(self):
         """Required by flask_login"""
         return False
@@ -273,7 +278,7 @@ def load_user(userid, session=None):
 
 @provide_session
 def login(self, request, session=None):
-    if current_user.is_authenticated():
+    if current_user.is_authenticated:
         flash("You are already logged in")
         return redirect(url_for('admin.index'))
 

@@ -25,6 +25,7 @@ implementation for BigQuery.
 import time
 from builtins import range
 from copy import deepcopy
+from six import iteritems
 
 from past.builtins import basestring
 
@@ -229,7 +230,8 @@ class BigQueryBaseCursor(LoggingMixin):
         :param table_id: The Name of the table to be created.
         :type table_id: str
         :param schema_fields: If set, the schema field list as defined here:
-        https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.load.schema
+            https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.load.schema
+        :type schema_fields: list
         :param labels: a dictionary containing labels for the table, passed to BigQuery
         :type labels: dict
 
@@ -238,7 +240,6 @@ class BigQueryBaseCursor(LoggingMixin):
             schema_fields=[{"name": "emp_name", "type": "STRING", "mode": "REQUIRED"},
                            {"name": "salary", "type": "INTEGER", "mode": "NULLABLE"}]
 
-        :type schema_fields: list
         :param time_partitioning: configure optional time partitioning fields i.e.
             partition by field, type and expiration as per API specifications.
 
@@ -480,8 +481,7 @@ class BigQueryBaseCursor(LoggingMixin):
             )
 
     def run_query(self,
-                  bql=None,
-                  sql=None,
+                  sql,
                   destination_dataset_table=None,
                   write_disposition='WRITE_EMPTY',
                   allow_large_results=False,
@@ -506,9 +506,6 @@ class BigQueryBaseCursor(LoggingMixin):
 
         For more details about these parameters.
 
-        :param bql: (Deprecated. Use `sql` parameter instead) The BigQuery SQL
-            to execute.
-        :type bql: str
         :param sql: The BigQuery SQL to execute.
         :type sql: str
         :param destination_dataset_table: The dotted <dataset>.<table>
@@ -526,6 +523,7 @@ class BigQueryBaseCursor(LoggingMixin):
         :type flatten_results: bool
         :param udf_config: The User Defined Function configuration for the query.
             See https://cloud.google.com/bigquery/user-defined-functions for details.
+        :type udf_config: list
         :param use_legacy_sql: Whether to use legacy SQL (true) or standard SQL (false).
             If `None`, defaults to `self.use_legacy_sql`.
         :type use_legacy_sql: bool
@@ -536,7 +534,6 @@ class BigQueryBaseCursor(LoggingMixin):
             if you need to provide some params that are not supported by the
             BigQueryHook like args.
         :type api_resource_configs: dict
-        :type udf_config: list
         :param maximum_billing_tier: Positive integer that serves as a
             multiplier of the basic price.
         :type maximum_billing_tier: int
@@ -582,19 +579,6 @@ class BigQueryBaseCursor(LoggingMixin):
         else:
             _validate_value("api_resource_configs['query']",
                             configuration['query'], dict)
-
-        sql = bql if sql is None else sql
-
-        # TODO remove `bql` in Airflow 2.0 - Jira: [AIRFLOW-2513]
-        if bql:
-            import warnings
-            warnings.warn('Deprecated parameter `bql` used in '
-                          '`BigQueryBaseCursor.run_query` '
-                          'Use `sql` parameter instead to pass the sql to be '
-                          'executed. `bql` parameter is deprecated and '
-                          'will be removed in a future version of '
-                          'Airflow.',
-                          category=DeprecationWarning)
 
         if sql is None and not configuration['query'].get('query', None):
             raise TypeError('`BigQueryBaseCursor.run_query` '
@@ -849,8 +833,8 @@ class BigQueryBaseCursor(LoggingMixin):
 
     def run_load(self,
                  destination_project_dataset_table,
-                 schema_fields,
                  source_uris,
+                 schema_fields=None,
                  source_format='CSV',
                  create_disposition='CREATE_IF_NEEDED',
                  skip_leading_rows=0,
@@ -864,7 +848,8 @@ class BigQueryBaseCursor(LoggingMixin):
                  schema_update_options=(),
                  src_fmt_configs=None,
                  time_partitioning=None,
-                 cluster_fields=None):
+                 cluster_fields=None,
+                 autodetect=False):
         """
         Executes a BigQuery load command to load data from Google Cloud Storage
         to BigQuery. See here:
@@ -882,7 +867,11 @@ class BigQueryBaseCursor(LoggingMixin):
         :type destination_project_dataset_table: str
         :param schema_fields: The schema field list as defined here:
             https://cloud.google.com/bigquery/docs/reference/v2/jobs#configuration.load
+            Required if autodetect=False; optional if autodetect=True.
         :type schema_fields: list
+        :param autodetect: Attempt to autodetect the schema for CSV and JSON
+            source files.
+        :type autodetect: bool
         :param source_uris: The source Google Cloud
             Storage URI (e.g. gs://some-bucket/some-file.txt). A single wild
             per-object name can be used.
@@ -937,6 +926,11 @@ class BigQueryBaseCursor(LoggingMixin):
         # if it's not, we raise a ValueError
         # Refer to this link for more details:
         #   https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.query.tableDefinitions.(key).sourceFormat
+
+        if schema_fields is None and not autodetect:
+            raise ValueError(
+                'You must either pass a schema or autodetect=True.')
+
         if src_fmt_configs is None:
             src_fmt_configs = {}
 
@@ -960,7 +954,7 @@ class BigQueryBaseCursor(LoggingMixin):
         if not set(allowed_schema_update_options).issuperset(
                 set(schema_update_options)):
             raise ValueError(
-                "{0} contains invalid schema update options. "
+                "{0} contains invalid schema update options."
                 "Please only use one or more of the following options: {1}"
                 .format(schema_update_options, allowed_schema_update_options))
 
@@ -971,6 +965,7 @@ class BigQueryBaseCursor(LoggingMixin):
 
         configuration = {
             'load': {
+                'autodetect': autodetect,
                 'createDisposition': create_disposition,
                 'destinationTable': {
                     'projectId': destination_project,
@@ -1350,6 +1345,72 @@ class BigQueryBaseCursor(LoggingMixin):
                 view_project, view_dataset, view_table, source_project, source_dataset)
             return source_dataset_resource
 
+    def create_empty_dataset(self, dataset_id="", project_id="",
+                             dataset_reference=None):
+        """
+        Create a new empty dataset:
+        https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets/insert
+
+        :param project_id: The name of the project where we want to create
+            an empty a dataset. Don't need to provide, if projectId in dataset_reference.
+        :type project_id: str
+        :param dataset_id: The id of dataset. Don't need to provide,
+            if datasetId in dataset_reference.
+        :type dataset_id: str
+        :param dataset_reference: Dataset reference that could be provided
+            with request body. More info:
+            https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets#resource
+        :type dataset_reference: dict
+        """
+
+        if dataset_reference:
+            _validate_value('dataset_reference', dataset_reference, dict)
+        else:
+            dataset_reference = {}
+
+        if "datasetReference" not in dataset_reference:
+            dataset_reference["datasetReference"] = {}
+
+        if not dataset_reference["datasetReference"].get("datasetId") and not dataset_id:
+            raise ValueError(
+                "{} not provided datasetId. Impossible to create dataset")
+
+        dataset_required_params = [(dataset_id, "datasetId", ""),
+                                   (project_id, "projectId", self.project_id)]
+        for param_tuple in dataset_required_params:
+            param, param_name, param_default = param_tuple
+            if param_name not in dataset_reference['datasetReference']:
+                if param_default and not param:
+                    self.log.info("{} was not specified. Will be used default "
+                                  "value {}.".format(param_name,
+                                                     param_default))
+                    param = param_default
+                dataset_reference['datasetReference'].update(
+                    {param_name: param})
+            elif param:
+                _api_resource_configs_duplication_check(
+                    param_name, param,
+                    dataset_reference['datasetReference'], 'dataset_reference')
+
+        dataset_id = dataset_reference.get("datasetReference").get("datasetId")
+        dataset_project_id = dataset_reference.get("datasetReference").get(
+            "projectId")
+
+        self.log.info('Creating Dataset: %s in project: %s ', dataset_id,
+                      dataset_project_id)
+
+        try:
+            self.service.datasets().insert(
+                projectId=dataset_project_id,
+                body=dataset_reference).execute()
+            self.log.info('Dataset created successfully: In project %s '
+                          'Dataset %s', dataset_project_id, dataset_id)
+
+        except HttpError as err:
+            raise AirflowException(
+                'BigQuery job failed. Error was: {}'.format(err.content)
+            )
+
     def delete_dataset(self, project_id, dataset_id):
         """
         Delete a dataset of Big query in your project.
@@ -1370,6 +1431,159 @@ class BigQueryBaseCursor(LoggingMixin):
             self.log.info('Dataset deleted successfully: In project %s '
                           'Dataset %s', project_id, dataset_id)
 
+        except HttpError as err:
+            raise AirflowException(
+                'BigQuery job failed. Error was: {}'.format(err.content)
+            )
+
+    def get_dataset(self, dataset_id, project_id=None):
+        """
+        Method returns dataset_resource if dataset exist
+        and raised 404 error if dataset does not exist
+
+        :param dataset_id: The BigQuery Dataset ID
+        :type dataset_id: str
+        :param project_id: The GCP Project ID
+        :type project_id: str
+        :return: dataset_resource
+
+            .. seealso::
+                For more information, see Dataset Resource content:
+                https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets#resource
+        """
+
+        if not dataset_id or not isinstance(dataset_id, str):
+            raise ValueError("dataset_id argument must be provided and has "
+                             "a type 'str'. You provided: {}".format(dataset_id))
+
+        dataset_project_id = project_id if project_id else self.project_id
+
+        try:
+            dataset_resource = self.service.datasets().get(
+                datasetId=dataset_id, projectId=dataset_project_id).execute()
+            self.log.info("Dataset Resource: {}".format(dataset_resource))
+        except HttpError as err:
+            raise AirflowException(
+                'BigQuery job failed. Error was: {}'.format(err.content))
+
+        return dataset_resource
+
+    def get_datasets_list(self, project_id=None):
+        """
+        Method returns full list of BigQuery datasets in the current project
+
+        .. seealso::
+            For more information, see:
+            https://cloud.google.com/bigquery/docs/reference/rest/v2/datasets/list
+
+        :param project_id: Google Cloud Project for which you
+            try to get all datasets
+        :type project_id: str
+        :return: datasets_list
+
+            Example of returned datasets_list: ::
+
+                   {
+                      "kind":"bigquery#dataset",
+                      "location":"US",
+                      "id":"your-project:dataset_2_test",
+                      "datasetReference":{
+                         "projectId":"your-project",
+                         "datasetId":"dataset_2_test"
+                      }
+                   },
+                   {
+                      "kind":"bigquery#dataset",
+                      "location":"US",
+                      "id":"your-project:dataset_1_test",
+                      "datasetReference":{
+                         "projectId":"your-project",
+                         "datasetId":"dataset_1_test"
+                      }
+                   }
+                ]
+        """
+        dataset_project_id = project_id if project_id else self.project_id
+
+        try:
+            datasets_list = self.service.datasets().list(
+                projectId=dataset_project_id).execute()['datasets']
+            self.log.info("Datasets List: {}".format(datasets_list))
+
+        except HttpError as err:
+            raise AirflowException(
+                'BigQuery job failed. Error was: {}'.format(err.content))
+
+        return datasets_list
+
+    def insert_all(self, project_id, dataset_id, table_id,
+                   rows, ignore_unknown_values=False,
+                   skip_invalid_rows=False, fail_on_error=False):
+        """
+        Method to stream data into BigQuery one record at a time without needing
+        to run a load job
+
+        .. seealso::
+            For more information, see:
+            https://cloud.google.com/bigquery/docs/reference/rest/v2/tabledata/insertAll
+
+        :param project_id: The name of the project where we have the table
+        :type project_id: str
+        :param dataset_id: The name of the dataset where we have the table
+        :type dataset_id: str
+        :param table_id: The name of the table
+        :type table_id: str
+        :param rows: the rows to insert
+        :type rows: list
+
+        **Example or rows**:
+            rows=[{"json": {"a_key": "a_value_0"}}, {"json": {"a_key": "a_value_1"}}]
+
+        :param ignore_unknown_values: [Optional] Accept rows that contain values
+            that do not match the schema. The unknown values are ignored.
+            The default value  is false, which treats unknown values as errors.
+        :type ignore_unknown_values: bool
+        :param skip_invalid_rows: [Optional] Insert all valid rows of a request,
+            even if invalid rows exist. The default value is false, which causes
+            the entire request to fail if any invalid rows exist.
+        :type skip_invalid_rows: bool
+        :param fail_on_error: [Optional] Force the task to fail if any errors occur.
+            The default value is false, which indicates the task should not fail
+            even if any insertion errors occur.
+        :type fail_on_error: bool
+        """
+
+        dataset_project_id = project_id if project_id else self.project_id
+
+        body = {
+            "rows": rows,
+            "ignoreUnknownValues": ignore_unknown_values,
+            "kind": "bigquery#tableDataInsertAllRequest",
+            "skipInvalidRows": skip_invalid_rows,
+        }
+
+        try:
+            self.log.info('Inserting {} row(s) into Table {}:{}.{}'.format(
+                len(rows), dataset_project_id,
+                dataset_id, table_id))
+
+            resp = self.service.tabledata().insertAll(
+                projectId=dataset_project_id, datasetId=dataset_id,
+                tableId=table_id, body=body
+            ).execute()
+
+            if 'insertErrors' not in resp:
+                self.log.info('All row(s) inserted successfully: {}:{}.{}'.format(
+                    dataset_project_id, dataset_id, table_id))
+            else:
+                error_msg = '{} insert error(s) occured: {}:{}.{}. Details: {}'.format(
+                    len(resp['insertErrors']),
+                    dataset_project_id, dataset_id, table_id, resp['insertErrors'])
+                if fail_on_error:
+                    raise AirflowException(
+                        'BigQuery job failed. Error was: {}'.format(error_msg)
+                    )
+                self.log.info(error_msg)
         except HttpError as err:
             raise AirflowException(
                 'BigQuery job failed. Error was: {}'.format(err.content)
@@ -1543,7 +1757,7 @@ def _bind_parameters(operation, parameters):
     """ Helper method that binds parameters to a SQL query. """
     # inspired by MySQL Python Connector (conversion.py)
     string_parameters = {}
-    for (name, value) in parameters.iteritems():
+    for (name, value) in iteritems(parameters):
         if value is None:
             string_parameters[name] = 'NULL'
         elif isinstance(value, basestring):
@@ -1588,7 +1802,7 @@ def _split_tablename(table_input, default_project_id, var_name=None):
 
     if '.' not in table_input:
         raise ValueError(
-            'Expected deletion_dataset_table name in the format of '
+            'Expected target table name in the format of '
             '<dataset>.<table>. Got: {}'.format(table_input))
 
     if not default_project_id:
@@ -1671,10 +1885,11 @@ def _validate_value(key, value, expected_type):
             key, expected_type, type(value)))
 
 
-def _api_resource_configs_duplication_check(key, value, config_dict):
+def _api_resource_configs_duplication_check(key, value, config_dict,
+                                            config_dict_name='api_resource_configs'):
     if key in config_dict and value != config_dict[key]:
         raise ValueError("Values of {param_name} param are duplicated. "
-                         "`api_resource_configs` contained {param_name} param "
+                         "{dict_name} contained {param_name} param "
                          "in `query` config and {param_name} was also provided "
                          "with arg to run_query() method. Please remove duplicates."
-                         .format(param_name=key))
+                         .format(param_name=key, dict_name=config_dict_name))

@@ -46,10 +46,11 @@ class S3KeySensor(BaseSensorOperator):
     :param verify: Whether or not to verify SSL certificates for S3 connection.
         By default SSL certificates are verified.
         You can provide the following values:
-        - False: do not validate SSL certificates. SSL will still be used
+
+        - ``False``: do not validate SSL certificates. SSL will still be used
                  (unless use_ssl is False), but SSL certificates will not be
                  verified.
-        - path/to/cert/bundle.pem: A filename of the CA cert bundle to uses.
+        - ``path/to/cert/bundle.pem``: A filename of the CA cert bundle to uses.
                  You can specify this argument if you want to use a different
                  CA cert bundle than the one used by botocore.
     :type verify: bool or str
@@ -73,10 +74,7 @@ class S3KeySensor(BaseSensorOperator):
                 raise AirflowException('Please provide a bucket_name')
             else:
                 bucket_name = parsed_url.netloc
-                if parsed_url.path[0] == '/':
-                    bucket_key = parsed_url.path[1:]
-                else:
-                    bucket_key = parsed_url.path
+                bucket_key = parsed_url.path.lstrip('/')
         else:
             parsed_url = urlparse(bucket_key)
             if parsed_url.scheme != '' or parsed_url.netloc != '':
@@ -97,5 +95,4 @@ class S3KeySensor(BaseSensorOperator):
         if self.wildcard_match:
             return hook.check_for_wildcard_key(self.bucket_key,
                                                self.bucket_name)
-        else:
-            return hook.check_for_key(self.bucket_key, self.bucket_name)
+        return hook.check_for_key(self.bucket_key, self.bucket_name)

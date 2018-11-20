@@ -1,3 +1,20 @@
+..  Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+..    http://www.apache.org/licenses/LICENSE-2.0
+
+..  Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+
 Time zones
 ==========
 
@@ -134,13 +151,13 @@ Cron schedules
 
 In case you set a cron schedule, Airflow assumes you will always want to run at the exact same time. It will
 then ignore day light savings time. Thus, if you have a schedule that says
-run at end of interval every day at 08:00 GMT+1 it will always run end of interval 08:00 GMT+1,
+run at the end of interval every day at 08:00 GMT+1 it will always run at the end of interval 08:00 GMT+1,
 regardless if day light savings time is in place.
 
 
 Time deltas
 '''''''''''
 For schedules with time deltas Airflow assumes you always will want to run with the specified interval. So if you
-specify a timedelta(hours=2) you will always want to run to hours later. In this case day light savings time will
+specify a timedelta(hours=2) you will always want to run two hours later. In this case day light savings time will
 be taken into account.
 
