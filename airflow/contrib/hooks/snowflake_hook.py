@@ -39,6 +39,8 @@ class SnowflakeHook(DbApiHook):
         self.account = kwargs.pop("account", None)
         self.warehouse = kwargs.pop("warehouse", None)
         self.database = kwargs.pop("database", None)
+        self.region = kwargs.pop("region", None)
+        self.role = kwargs.pop("role", None)
 
     def _get_conn_params(self):
         """
@@ -49,6 +51,8 @@ class SnowflakeHook(DbApiHook):
         account = conn.extra_dejson.get('account', None)
         warehouse = conn.extra_dejson.get('warehouse', None)
         database = conn.extra_dejson.get('database', None)
+        region = conn.extra_dejson.get("region", None)
+        role = conn.extra_dejson.get('role', None)
 
         conn_config = {
             "user": conn.login,
@@ -56,7 +60,9 @@ class SnowflakeHook(DbApiHook):
             "schema": conn.schema or '',
             "database": self.database or database or '',
             "account": self.account or account or '',
-            "warehouse": self.warehouse or warehouse or ''
+            "warehouse": self.warehouse or warehouse or '',
+            "region": self.region or region or '',
+            "role": self.role or role or '',
         }
         return conn_config
 
@@ -66,9 +72,8 @@ class SnowflakeHook(DbApiHook):
         """
         conn_config = self._get_conn_params()
         uri = 'snowflake://{user}:{password}@{account}/{database}/'
-        uri += '{schema}?warehouse={warehouse}'
-        return uri.format(
-            **conn_config)
+        uri += '{schema}?warehouse={warehouse}&role={role}'
+        return uri.format(**conn_config)
 
     def get_conn(self):
         """
